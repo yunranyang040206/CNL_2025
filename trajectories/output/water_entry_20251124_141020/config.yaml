@@ -1,0 +1,27 @@
+grid:
+  size: 5
+
+mdp:
+  gamma: 0.99
+  tau: 0.5
+  max_iters: 1000
+  tol: 1.0e-6
+
+trajectories:
+  n_episodes: 200
+  t_steps: 500
+  seed: 1
+
+rewards:
+  state_based: {}
+  sequence_based:
+    - sequence_type: "state_transition"
+      description: "Entering water from non-water state"
+      to_state: 24           # WATER state (4,4)
+      not_from_state: 24     # Previous state must NOT be water
+      reward: 1.0
+
+mode_switching:
+  base_prob: 0.0
+  bonus_prob: 0.0
+  trigger_states: {}
