@@ -1,0 +1,37 @@
+grid:
+  size: 5
+
+mdp:
+  gamma: 0.99
+  tau: 0.5
+  max_iters: 1000
+  tol: 1.0e-6
+
+trajectories:
+  n_episodes: 200
+  t_steps: 500
+  seed: 1
+
+rewards:
+  state_based:
+    0: 1.0  # HOME state (0,0) gives reward 1.0
+  sequence_based:
+    - sequence_type: "state_transition"
+      description: "Crossing water boundary"
+      from_state: null  # any state except 24
+      to_state: 24      # WATER state (4,4)
+      not_from_state: 24
+      reward: 1.0
+    - sequence_type: "state_transition"
+      description: "Leaving water boundary"
+      from_state: 24
+      to_state: null    # any state except 24
+      not_to_state: 24
+      reward: 1.0
+
+mode_switching:
+  base_prob: 0.05
+  bonus_prob: 0.45
+  trigger_states:
+    0: "water_to_home"  # at HOME, more likely to switch to WATER mode
+    24: "home_to_water" # at WATER, more likely to switch to HOME mode
