@@ -64,11 +64,10 @@ def plot_reward_schematic(data):
     plt.close()
 
 # ===========================
-# PLOT 2: FULL TRAJECTORY (EXTERNAL LEGEND)
+# PLOT 2: FULL TRAJECTORY (Explicit Labels)
 # ===========================
 def plot_full_trajectory(data):
-    # Increased width to make room for the legend on the right
-    fig, ax = plt.subplots(figsize=(12, 10))
+    fig, ax = plt.subplots(figsize=(10, 10))
     setup_grid(ax, "Full 500-Step Trajectory\n(Highlighting Start of Thirst Cycles)")
     
     traj = data['xs']; modes = data['zs']
@@ -78,6 +77,7 @@ def plot_full_trajectory(data):
     xs = xs + np.random.normal(0, 0.08, size=xs.shape)
     ys = ys + np.random.normal(0, 0.08, size=ys.shape)
     
+    # Loop safely
     num_steps = min(len(traj)-1, len(modes))
     
     for i in range(num_steps):
@@ -87,7 +87,7 @@ def plot_full_trajectory(data):
         zorder = 10 if modes[i] == 1 else 1
         ax.plot([xs[i], xs[i+1]], [ys[i], ys[i+1]], color=color, alpha=alpha, lw=width, zorder=zorder)
 
-        # 1. Very First Start
+        # 1. Very First Start (Always label t=0)
         if i == 0:
             if modes[0] == 1:
                 ax.text(xs[0], ys[0], "t=0\nStart Thirsty", fontsize=9, fontweight='bold', 
@@ -98,14 +98,15 @@ def plot_full_trajectory(data):
 
         # 2. Switches
         if i > 0 and modes[i] != modes[i-1]:
-            # Explore -> Water [THIRST ONSET]
+            
+            # Explore (0) -> Water (1) [THIRST ONSET]
             if modes[i-1] == 0 and modes[i] == 1:
                 label = f"t={i}\nThirsty"
                 ax.text(xs[i], ys[i], label, fontsize=9, fontweight='bold',
                         bbox=dict(facecolor='white', alpha=0.9, pad=0.5, edgecolor='#e63946'), 
                         zorder=40, ha='right', va='bottom')
             
-            # Water -> Explore [DRINKING DONE]
+            # Water (1) -> Explore (0) [DRINKING DONE]
             if modes[i-1] == 1 and modes[i] == 0:
                 ax.plot(xs[i], ys[i], marker='D', color='gold', markersize=14, 
                         markeredgecolor='black', mew=2, zorder=30)
@@ -118,53 +119,59 @@ def plot_full_trajectory(data):
         Line2D([0], [0], marker='s', color='w', markerfacecolor='white', 
                markeredgecolor='#e63946', markersize=10, label='Thirst Onset'),
     ]
+    ax.legend(handles=legend_elements, loc='upper right')
     
-    # MOVE LEGEND OUTSIDE
-    # bbox_to_anchor=(1.05, 1) puts it just outside the top-right corner
-    ax.legend(handles=legend_elements, loc='upper left', bbox_to_anchor=(1.02, 1.0), borderaxespad=0.)
-    
-    plt.tight_layout()
-    # bbox_inches='tight' ensures the external legend is included in the saved PNG
-    plt.savefig(f"{CONFIG['output_dir']}/2_full_trajectory.png", bbox_inches='tight')
+    plt.savefig(f"{CONFIG['output_dir']}/2_full_trajectory.png")
     plt.close()
 
 # ===========================
-# PLOT 3: ZOOMED SEGMENTS
+# PLOT 3: ZOOMED SEGMENTS (Precise Endpoint)
 # ===========================
 def plot_zoomed_segments(data):
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 7))
     traj = data['xs']; modes = data['zs']
     
+    # 1. Identify the Switching Index
+    # 'end_water' is the index in ZS where the mode becomes 0.
+    # This corresponds to the state index where the Explore phase BEGINS.
     end_water = np.argmax(modes == 0)
     
-    water_slice_end = end_water 
-    lookahead = traj[max(0, end_water-2) : end_water+2]
-    if 24 in lookahead:
-        offset = np.where(lookahead == 24)[0][0]
-        water_slice_end = max(0, end_water - 2) + offset
-
-    end_explore = end_water + np.argmax(modes[end_water:] == 1)
+    # This state is SHARED. It is the end of Water and Start of Explore.
+    # So we use 'end_water' as the anchor for both.
+    join_point_idx = end_water
     
-    def plot_seg(ax, start, end, title, color):
+    # Find end of Explore
+    end_explore = join_point_idx + np.argmax(modes[join_point_idx:] == 1)
+    
+    def plot_seg(ax, start_idx, end_idx, title, color):
         setup_grid(ax, title)
-        segment = traj[start : end + 1]
+        
+        # Slice including the endpoint
+        segment = traj[start_idx : end_idx + 1]
+        
         coords = np.array([divmod(s, 5) for s in segment])
         ys, xs = coords[:, 0], coords[:, 1]
         xs = xs + np.random.normal(0, 0.06, size=xs.shape)
         ys = ys + np.random.normal(0, 0.06, size=ys.shape)
         
         ax.plot(xs, ys, color=color, lw=2.5, alpha=0.8, marker='.', markersize=5)
-        ax.text(xs[0], ys[0], f"Start\nt={start}", ha='right', fontsize=9, fontweight='bold')
-        ax.text(xs[-1], ys[-1], f"End\nt={end}", ha='left', fontsize=9, fontweight='bold')
+        
+        # Text Labels
+        ax.text(xs[0], ys[0], f"Start\nt={start_idx}", ha='right', fontsize=9, fontweight='bold')
+        ax.text(xs[-1], ys[-1], f"End\nt={end_idx}", ha='left', fontsize=9, fontweight='bold')
+        
         ax.plot(xs[0], ys[0], 'go', markersize=8)
         
-        if color == '#e63946': 
+        if color == '#e63946': # Water end
             ax.plot(xs[-1], ys[-1], marker='D', color='gold', markersize=12, markeredgecolor='black')
-        else:
+        else: # Explore end
             ax.plot(xs[-1], ys[-1], 'k*', markersize=12)
 
-    plot_seg(ax1, 0, water_slice_end, "First 'Water' Cycle\n(Efficient Path)", '#e63946')
-    plot_seg(ax2, water_slice_end, end_explore, "First 'Explore' Cycle\n(Random Walk - 100 steps)", '#457b9d')
+    # Plot Water: 0 -> join_point
+    plot_seg(ax1, 0, join_point_idx, "First 'Water' Cycle\n(Efficient Path)", '#e63946')
+    
+    # Plot Explore: join_point -> end_explore
+    plot_seg(ax2, join_point_idx, end_explore, "First 'Explore' Cycle\n(Random Walk - 100 steps)", '#457b9d')
     
     plt.savefig(f"{CONFIG['output_dir']}/3_zoomed_cycles.png")
     plt.close()
@@ -175,4 +182,4 @@ if __name__ == "__main__":
     plot_reward_schematic(data)
     plot_full_trajectory(data)
     plot_zoomed_segments(data)
-    print(f"Final plots (Legend Fixed) saved to {CONFIG['output_dir']}/")
+    print(f"Final plots saved to {CONFIG['output_dir']}/")
