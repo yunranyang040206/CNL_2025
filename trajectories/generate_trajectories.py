@@ -6,7 +6,7 @@ import os
 # ===========================
 CONFIG = {
     "grid_size": 5,
-    "n_episodes": 1,
+    "n_episodes": 200,
     "max_steps": 500,
     "explore_duration": 100,
     "seq_start_node": 20,
