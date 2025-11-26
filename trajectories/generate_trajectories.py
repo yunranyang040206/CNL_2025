@@ -1,178 +1,123 @@
 import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
 import os
-import matplotlib.patches as patches
-from matplotlib.lines import Line2D
 
 # ===========================
 # CONFIGURATION
 # ===========================
 CONFIG = {
-    'data_dir': './output',
-    'output_dir': './plots',
-    'grid_size': 5,
-    'jitter': 0.08
+    "grid_size": 5,
+    "n_episodes": 1,
+    "max_steps": 500,
+    "explore_duration": 100,
+    "seq_start_node": 20,
+    "seq_end_node": 24,
+    "noise": 0.05,
+    "output_dir": "./output",
 }
 
-sns.set_theme(style="white", context="talk", font_scale=1.0)
+N_STATES = CONFIG["grid_size"] ** 2
+N_ACTIONS = 5
+ACTION_MAP = {0: ((-1, 0)), 1: ((1, 0)), 2: ((0, -1)), 3: ((0, 1)), 4: ((0, 0))}
 
-def load_data():
-    return {
-        'xs': np.load(f"{CONFIG['data_dir']}/xs.npy", allow_pickle=True)[0],
-        'zs': np.load(f"{CONFIG['data_dir']}/zs.npy", allow_pickle=True)[0],
-        'RG': np.load(f"{CONFIG['data_dir']}/RG.npy")
-    }
-
-def setup_grid(ax, title):
-    ax.set_xlim(-0.5, 4.5); ax.set_ylim(4.5, -0.5)
-    ax.set_aspect('equal')
-    ax.set_xticks([]); ax.set_yticks([])
-    ax.set_title(title, fontweight='bold', pad=10)
-    for x in range(6):
-        ax.axvline(x - 0.5, color='#eeeeee', lw=1)
-        ax.axhline(x - 0.5, color='#eeeeee', lw=1)
-    for r in range(5):
-        for c in range(5):
-            circle = patches.Circle((c, r), 0.1, color='#dddddd')
-            ax.add_patch(circle)
 
 # ===========================
-# PLOT 1: REWARD MAPS
+# STATIC FILES
 # ===========================
-def plot_reward_schematic(data):
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 7))
-    
-    setup_grid(ax1, "Mode 1: Water Seeking\n(Sparse Reward = 10)")
-    ax1.arrow(0, 4, 3, 0, color='#e63946', width=0.05, head_width=0, linestyle='--')
-    ax1.text(1.5, 3.8, "Required History\n(Must traverse bottom)", color='#e63946', fontsize=10, ha='center')
-    ax1.arrow(3.2, 4, 0.6, 0, color='#e63946', width=0.08, head_width=0.3)
-    rect = patches.Rectangle((3.6, 3.6), 0.8, 0.8, linewidth=2, edgecolor='#e63946', facecolor='#ffcccc')
-    ax1.add_patch(rect)
-    ax1.text(4, 4, "+10", color='#e63946', fontweight='bold', ha='center', va='center')
+def generate_static_files():
+    # Reward Grid: (2 Modes, 25 From_State, 25 To_State)
+    RG = np.zeros((2, N_STATES, N_STATES), dtype=np.float32)
+    RG[0, :, :] = 0.0
+    RG[1, 23, 24] = 10.0  # Sparse Reward only in Water Mode
+    return RG
 
-    setup_grid(ax2, "Mode 2: Exploration\n(Zero Reward)")
-    ax2.text(2, 2, "Uniform Reward (0.0)\nNo History Requirement", 
-             ha='center', va='center', color='#457b9d', style='italic')
-
-    rules = "SWITCHING RULES:\n1. Start Thirsty (Mode 1).\n2. If +10 Reward -> Satiated (Mode 2).\n3. Satiated 100 steps -> Thirsty (Mode 1)."
-    fig.text(0.5, 0.05, rules, ha='center', fontsize=12, bbox=dict(boxstyle="round", facecolor="#f0f0f0", edgecolor="none", pad=1))
-    
-    plt.tight_layout()
-    plt.subplots_adjust(bottom=0.2)
-    plt.savefig(f"{CONFIG['output_dir']}/1_reward_maps_and_rules.png")
-    plt.close()
 
 # ===========================
-# PLOT 2: FULL TRAJECTORY (EXTERNAL LEGEND)
+# AGENT LOGIC
 # ===========================
-def plot_full_trajectory(data):
-    # Increased width to make room for the legend on the right
-    fig, ax = plt.subplots(figsize=(12, 10))
-    setup_grid(ax, "Full 500-Step Trajectory\n(Highlighting Start of Thirst Cycles)")
-    
-    traj = data['xs']; modes = data['zs']
-    coords = np.array([divmod(s, 5) for s in traj])
-    ys, xs = coords[:, 0], coords[:, 1]
-    
-    xs = xs + np.random.normal(0, 0.08, size=xs.shape)
-    ys = ys + np.random.normal(0, 0.08, size=ys.shape)
-    
-    num_steps = min(len(traj)-1, len(modes))
-    
-    for i in range(num_steps):
-        color = '#e63946' if modes[i] == 1 else '#457b9d'
-        alpha = 0.8 if modes[i] == 1 else 0.3
-        width = 2.0 if modes[i] == 1 else 1.0
-        zorder = 10 if modes[i] == 1 else 1
-        ax.plot([xs[i], xs[i+1]], [ys[i], ys[i+1]], color=color, alpha=alpha, lw=width, zorder=zorder)
+def get_water_action(curr_state, has_touched_start):
+    grid_n = CONFIG["grid_size"]
+    curr_r, curr_c = divmod(curr_state, grid_n)
+    if has_touched_start:
+        if curr_r == 4:
+            return 3  # Right
+        return 1  # Down
+    target_r, target_c = divmod(CONFIG["seq_start_node"], grid_n)
+    if curr_r < target_r:
+        return 1
+    if curr_c > target_c:
+        return 2
+    return 4
 
-        # 1. Very First Start
-        if i == 0:
-            if modes[0] == 1:
-                ax.text(xs[0], ys[0], "t=0\nStart Thirsty", fontsize=9, fontweight='bold', 
-                        bbox=dict(facecolor='#ffcccc', alpha=1.0, pad=0.5, edgecolor='#e63946'), 
-                        zorder=40)
+
+def get_next_state(state, action):
+    r, c = divmod(state, CONFIG["grid_size"])
+    dr, dc = ACTION_MAP[action]
+    r2 = np.clip(r + dr, 0, CONFIG["grid_size"] - 1)
+    c2 = np.clip(c + dc, 0, CONFIG["grid_size"] - 1)
+    return r2 * CONFIG["grid_size"] + c2
+
+
+def generate_trajectories():
+    all_xs, all_acs, all_zs = [], [], []
+
+    for i in range(CONFIG["n_episodes"]):
+        curr = np.random.randint(0, N_STATES)
+        is_thirsty = True
+        thirst_timer = 0
+        has_touched_start = curr == CONFIG["seq_start_node"]
+
+        traj_x = [curr]
+        traj_a = []
+        traj_z = []
+
+        for t in range(CONFIG["max_steps"]):
+            # --- DECISION ---
+            if is_thirsty:
+                z = 1
+                if curr == CONFIG["seq_start_node"]:
+                    has_touched_start = True
+                action = get_water_action(curr, has_touched_start)
             else:
-                ax.plot(xs[0], ys[0], 'go', markersize=12, label='Start', zorder=20)
+                z = 0
+                action = np.random.randint(0, 4)
 
-        # 2. Switches
-        if i > 0 and modes[i] != modes[i-1]:
-            # Explore -> Water [THIRST ONSET]
-            if modes[i-1] == 0 and modes[i] == 1:
-                label = f"t={i}\nThirsty"
-                ax.text(xs[i], ys[i], label, fontsize=9, fontweight='bold',
-                        bbox=dict(facecolor='white', alpha=0.9, pad=0.5, edgecolor='#e63946'), 
-                        zorder=40, ha='right', va='bottom')
-            
-            # Water -> Explore [DRINKING DONE]
-            if modes[i-1] == 1 and modes[i] == 0:
-                ax.plot(xs[i], ys[i], marker='D', color='gold', markersize=14, 
-                        markeredgecolor='black', mew=2, zorder=30)
+            if np.random.rand() < CONFIG["noise"]:
+                action = np.random.randint(0, 4)
 
-    legend_elements = [
-        Line2D([0], [0], color='#e63946', lw=3, label='Water (Seek)'),
-        Line2D([0], [0], color='#457b9d', lw=3, label='Explore (Random)'),
-        Line2D([0], [0], marker='D', color='w', markerfacecolor='gold', 
-               markeredgecolor='black', markersize=12, label='Finished Drinking'),
-        Line2D([0], [0], marker='s', color='w', markerfacecolor='white', 
-               markeredgecolor='#e63946', markersize=10, label='Thirst Onset'),
-    ]
-    
-    # MOVE LEGEND OUTSIDE
-    # bbox_to_anchor=(1.05, 1) puts it just outside the top-right corner
-    ax.legend(handles=legend_elements, loc='upper left', bbox_to_anchor=(1.02, 1.0), borderaxespad=0.)
-    
-    plt.tight_layout()
-    # bbox_inches='tight' ensures the external legend is included in the saved PNG
-    plt.savefig(f"{CONFIG['output_dir']}/2_full_trajectory.png", bbox_inches='tight')
-    plt.close()
+            # --- STEP ---
+            next_s = get_next_state(curr, action)
+            traj_x.append(next_s)
+            traj_a.append(action)
+            traj_z.append(z)
+            curr = next_s
 
-# ===========================
-# PLOT 3: ZOOMED SEGMENTS
-# ===========================
-def plot_zoomed_segments(data):
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 7))
-    traj = data['xs']; modes = data['zs']
-    
-    end_water = np.argmax(modes == 0)
-    
-    water_slice_end = end_water 
-    lookahead = traj[max(0, end_water-2) : end_water+2]
-    if 24 in lookahead:
-        offset = np.where(lookahead == 24)[0][0]
-        water_slice_end = max(0, end_water - 2) + offset
+            # --- TRANSITIONS ---
+            if is_thirsty:
+                # Drink Water -> Satiated
+                if curr == CONFIG["seq_end_node"] and has_touched_start:
+                    is_thirsty = False
+                    thirst_timer = 0
+            else:
+                # Wait -> Thirsty (Check for >= 100)
+                thirst_timer += 1
+                if thirst_timer >= CONFIG["explore_duration"]:
+                    is_thirsty = True
+                    has_touched_start = False
 
-    end_explore = end_water + np.argmax(modes[end_water:] == 1)
-    
-    def plot_seg(ax, start, end, title, color):
-        setup_grid(ax, title)
-        segment = traj[start : end + 1]
-        coords = np.array([divmod(s, 5) for s in segment])
-        ys, xs = coords[:, 0], coords[:, 1]
-        xs = xs + np.random.normal(0, 0.06, size=xs.shape)
-        ys = ys + np.random.normal(0, 0.06, size=ys.shape)
-        
-        ax.plot(xs, ys, color=color, lw=2.5, alpha=0.8, marker='.', markersize=5)
-        ax.text(xs[0], ys[0], f"Start\nt={start}", ha='right', fontsize=9, fontweight='bold')
-        ax.text(xs[-1], ys[-1], f"End\nt={end}", ha='left', fontsize=9, fontweight='bold')
-        ax.plot(xs[0], ys[0], 'go', markersize=8)
-        
-        if color == '#e63946': 
-            ax.plot(xs[-1], ys[-1], marker='D', color='gold', markersize=12, markeredgecolor='black')
-        else:
-            ax.plot(xs[-1], ys[-1], 'k*', markersize=12)
+        all_xs.append(np.array(traj_x, dtype=np.int64))
+        all_acs.append(np.array(traj_a, dtype=np.int64))
+        all_zs.append(np.array(traj_z, dtype=np.int64))
 
-    plot_seg(ax1, 0, water_slice_end, "First 'Water' Cycle\n(Efficient Path)", '#e63946')
-    plot_seg(ax2, water_slice_end, end_explore, "First 'Explore' Cycle\n(Random Walk - 100 steps)", '#457b9d')
-    
-    plt.savefig(f"{CONFIG['output_dir']}/3_zoomed_cycles.png")
-    plt.close()
+    return all_xs, all_acs, all_zs
+
 
 if __name__ == "__main__":
-    os.makedirs(CONFIG['output_dir'], exist_ok=True)
-    data = load_data()
-    plot_reward_schematic(data)
-    plot_full_trajectory(data)
-    plot_zoomed_segments(data)
-    print(f"Final plots (Legend Fixed) saved to {CONFIG['output_dir']}/")
+    os.makedirs(CONFIG["output_dir"], exist_ok=True)
+    RG = generate_static_files()
+    xs, acs, zs = generate_trajectories()
+
+    np.save(f"{CONFIG['output_dir']}/RG.npy", RG)
+    np.save(f"{CONFIG['output_dir']}/xs.npy", np.array(xs, dtype=object))
+    np.save(f"{CONFIG['output_dir']}/acs.npy", np.array(acs, dtype=object))
+    np.save(f"{CONFIG['output_dir']}/zs.npy", np.array(zs, dtype=object))
+    print("Data Generated (100-step hydration).")
