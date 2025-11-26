@@ -1,4 +1,4 @@
-# Detail View: The Forward Pass (K Modes)
+# Forward Pass
 
 ```mermaid
 flowchart TD

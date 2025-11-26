@@ -1,5 +1,3 @@
-# SWIRL Training Flow: Where Backprop Happens
-
 ```mermaid
 flowchart TD
     %% Styles
