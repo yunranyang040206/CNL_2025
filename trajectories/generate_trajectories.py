@@ -20,15 +20,34 @@ N_ACTIONS = 5
 ACTION_MAP = {0: ((-1, 0)), 1: ((1, 0)), 2: ((0, -1)), 3: ((0, 1)), 4: ((0, 0))}
 
 
+def get_next_state(state, action):
+    r, c = divmod(state, CONFIG["grid_size"])
+    dr, dc = ACTION_MAP[action]
+    r2 = np.clip(r + dr, 0, CONFIG["grid_size"] - 1)
+    c2 = np.clip(c + dc, 0, CONFIG["grid_size"] - 1)
+    return r2 * CONFIG["grid_size"] + c2
+
+
 # ===========================
 # STATIC FILES
 # ===========================
 def generate_static_files():
-    # Reward Grid: (2 Modes, 25 From_State, 25 To_State)
+    # 1. Reward Grid: (2 Modes, 25 From_State, 25 To_State)
     RG = np.zeros((2, N_STATES, N_STATES), dtype=np.float32)
     RG[0, :, :] = 0.0
     RG[1, 23, 24] = 10.0  # Sparse Reward only in Water Mode
-    return RG
+
+    # 2. Transition Probability Matrix: (25 From_State, 5 Actions, 25 To_State)
+    # This defines the physics of the grid
+    trans_prob = np.zeros((N_STATES, N_ACTIONS, N_STATES), dtype=np.float32)
+
+    for s in range(N_STATES):
+        for a in range(N_ACTIONS):
+            next_s = get_next_state(s, a)
+            # Since grid is deterministic, probability is 1.0 for the outcome
+            trans_prob[s, a, next_s] = 1.0
+
+    return RG, trans_prob
 
 
 # ===========================
@@ -47,14 +66,6 @@ def get_water_action(curr_state, has_touched_start):
     if curr_c > target_c:
         return 2
     return 4
-
-
-def get_next_state(state, action):
-    r, c = divmod(state, CONFIG["grid_size"])
-    dr, dc = ACTION_MAP[action]
-    r2 = np.clip(r + dr, 0, CONFIG["grid_size"] - 1)
-    c2 = np.clip(c + dc, 0, CONFIG["grid_size"] - 1)
-    return r2 * CONFIG["grid_size"] + c2
 
 
 def generate_trajectories():
@@ -113,11 +124,19 @@ def generate_trajectories():
 
 if __name__ == "__main__":
     os.makedirs(CONFIG["output_dir"], exist_ok=True)
-    RG = generate_static_files()
+
+    # Generate both static files
+    RG, trans_prob = generate_static_files()
+
+    # Generate trajectories
     xs, acs, zs = generate_trajectories()
 
+    # Save Everything
     np.save(f"{CONFIG['output_dir']}/RG.npy", RG)
+    np.save(f"{CONFIG['output_dir']}/trans_prob.npy", trans_prob)
+
     np.save(f"{CONFIG['output_dir']}/xs.npy", np.array(xs, dtype=object))
     np.save(f"{CONFIG['output_dir']}/acs.npy", np.array(acs, dtype=object))
     np.save(f"{CONFIG['output_dir']}/zs.npy", np.array(zs, dtype=object))
-    print("Data Generated (100-step hydration).")
+
+    print(f"Data Generated in {CONFIG['output_dir']}")
