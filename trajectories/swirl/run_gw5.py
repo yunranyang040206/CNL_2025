@@ -1,71 +1,123 @@
+#!/usr/bin/env python3
+"""
+GW5 training script (paper-style SWIRL transitions) + h_t (GTrXL embeddings) for time-varying, mode-specific rewards.
+  - Uses swirl_func.jaxnet_e_step_batch2 (expects logemit_list)
+  - Uses swirl_func.trans_m_step_jax_optax
+  - Uses swirl_func.emit_m_step_jaxnet_optax2 (expects one_hot_hs)
+  - Uses swirl_func.pi0_m_step
+  - Uses swirl_func.soft_vi_sa to build logemit_list from the reward net
+"""
+import os
+import sys
 import numpy as np
-import numpy.random as npr
-from scipy.special import logsumexp
 
 import jax
 import jax.numpy as jnp
-from jax import lax, vmap, jit
-from functools import partial
+from jax import vmap
 from jax.scipy.special import logsumexp as jax_logsumexp
+
 import optax
+from flax import linen as nn
+from flax.training import train_state
+
+# ---- import your algorithmic pieces from swirl_func.py
+from swirl_func import (
+    soft_vi_sa,
+    jaxnet_e_step_batch2,
+    trans_m_step_jax_optax,
+    emit_m_step_jaxnet_optax2,
+    pi0_m_step,
+)
+
 jax.config.update("jax_enable_x64", True)
-jax.config.update("jax_platform_name", "cpu")
 
-import sys
-import os
+# -----------------------------
+# Args / paths
+# -----------------------------
+seed = int(sys.argv[1]) if len(sys.argv) > 1 else 0
 
-if len(sys.argv) < 2:
-    seed = 12345
-else:
-    seed = int(sys.argv[1])
+DATASET = sys.argv[2] if len(sys.argv) > 2 else "gw5"
 
-# dataset folder name 
-if len(sys.argv) < 3:
-    dataset_folder = "long_term" # fallback
-else:
-    dataset_folder = sys.argv[2]
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
-root_dir = "../output"
-folder = os.path.join(root_dir, dataset_folder)
-save_folder = os.path.join(root_dir, "swirl_result", dataset_folder)
+data_folder = os.path.join(BASE_DIR, "output")
+save_folder = os.path.join(BASE_DIR, "output", "swirl_result", DATASET)
+
 os.makedirs(save_folder, exist_ok=True)
 
-# Constants
-K = 2
-D = 1
-C = 25
+# Your embedding folder
+EMBED_DIR = "/home/yunran-yang/EngSci/Computational_Neuro_Lab/CNL_2025/trajectories/output/gtrxl_small_H5"
 
-trans_probs = np.load(folder + '/trans_probs.npy', allow_pickle=True)
-zs = np.load(folder + '/zs.npy', allow_pickle=True)[:200]
-xs = np.load(folder + '/xs.npy', allow_pickle=True)[:200]
-acs = np.load(folder + '/acs.npy', allow_pickle=True)[:200]
+# -----------------------------
+# Load dataset artifacts
+# -----------------------------
+trans_probs = np.load(os.path.join(data_folder, "trans_prob.npy"), allow_pickle=True)  # (S,A,S)
+xs = np.load(os.path.join(data_folder, "xs.npy"), allow_pickle=True)[:200]
+acs = np.load(os.path.join(data_folder, "acs.npy"), allow_pickle=True)[:200]
+zs = np.load(os.path.join(data_folder, "zs.npy"), allow_pickle=True)[:200]  # optional but used for acc
 
-xs = np.array(xs, dtype=int)  
-acs = np.array(acs, dtype=int)
-zs = np.array(zs, dtype=int)
+S, A, S2 = trans_probs.shape
+assert S == S2
 
+xs = np.asarray(xs, dtype=int)
+acs = np.asarray(acs, dtype=int)
+zs = np.asarray(zs, dtype=int)
 
-test_indices = np.arange(0, xs.shape[0], 5).astype(int)
-train_indices = np.setdiff1d(np.arange(xs.shape[0]), test_indices).astype(int)
+# align decision-time states with actions
+if xs.shape[1] == acs.shape[1] + 1:
+    xs_dec = xs[:, :-1]
+else:
+    xs_dec = xs[:, :acs.shape[1]]
 
-test_xs, test_acs = xs[test_indices].astype(int), acs[test_indices].astype(int)
-train_xs, train_acs = xs[train_indices].astype(int), acs[train_indices].astype(int)
-test_zs, train_zs = zs[test_indices].astype(int), zs[train_indices].astype(int)
+# -----------------------------
+# Load embeddings + verify alignment
+# -----------------------------
+h_npz = np.load(os.path.join(EMBED_DIR, "h_gw5.npz"), allow_pickle=True)
+print("h_gw5.npz keys:", h_npz.files)
+h_all = h_npz["h"] if "h" in h_npz.files else h_npz[h_npz.files[0]]  # (N,T_embed,H)
 
-T_x = train_xs.shape[1]
-T_a = train_acs.shape[1]
-T = min(T_x, T_a)
+xs_npz = np.load(os.path.join(EMBED_DIR, "xs_gw5_for_embed.npz"), allow_pickle=True)
+print("xs_gw5_for_embed.npz keys:", xs_npz.files)
+xs_for_embed = xs_npz["xs"] if "xs" in xs_npz.files else xs_npz[xs_npz.files[0]]
 
-train_xs = train_xs[:, :T]
-train_acs = train_acs[:, :T]
-test_xs  = test_xs[:, :T]
-test_acs = test_acs[:, :T]
-xs = xs[:, :T]
+n = min(xs_for_embed.shape[0], xs_dec.shape[0])
+t_min = min(xs_for_embed.shape[1], xs_dec.shape[1])
+
+same_prefix = np.all(xs_for_embed[:n, :t_min] == xs_dec[:n, :t_min])
+same_shift = False
+if xs_dec.shape[1] == xs_for_embed.shape[1] + 1:
+    same_shift = np.all(xs_for_embed[:n, :] == xs_dec[:n, 1:1+xs_for_embed.shape[1]])
+elif xs_for_embed.shape[1] == xs_dec.shape[1] + 1:
+    same_shift = np.all(xs_for_embed[:n, 1:1+xs_dec.shape[1]] == xs_dec[:n, :])
+
+print(f"[align] xs_dec: {xs_dec.shape}, xs_for_embed: {xs_for_embed.shape}")
+print(f"[align] same_prefix(overlap)={same_prefix}, same_shift(off-by-one)={same_shift}")
+if not (same_prefix or same_shift):
+    raise ValueError("Embedding xs do NOT match xs_dec (even with off-by-one shift).")
+
+# trim to common T
+T = min(xs_dec.shape[1], acs.shape[1], zs.shape[1], h_all.shape[1])
+xs_dec = xs_dec[:, :T]
 acs = acs[:, :T]
+zs = zs[:, :T]
+h_all = h_all[:xs_dec.shape[0], :T]  # (N,T,H)
 
+print(f"[trim] N={xs_dec.shape[0]}, T={T}, S={S}, A={A}, H={h_all.shape[-1]}")
 
+# -----------------------------
+# Train/test split (every 5th episode test)
+# -----------------------------
+test_indices = np.arange(0, xs_dec.shape[0], 5).astype(int)
+train_indices = np.setdiff1d(np.arange(xs_dec.shape[0]), test_indices).astype(int)
 
-n_states, n_actions, _ = trans_probs.shape
+train_xs, test_xs = xs_dec[train_indices], xs_dec[test_indices]
+train_acs, test_acs = acs[train_indices], acs[test_indices]
+train_zs, test_zs = zs[train_indices], zs[test_indices]
+train_hs, test_hs = h_all[train_indices], h_all[test_indices]
+
+# -----------------------------
+# One-hot (JAX) helpers (matches your preference)
+# -----------------------------
 def one_hot_jax(z, K):
     z = jnp.atleast_1d(z).astype(int)
     shp = z.shape
@@ -75,254 +127,276 @@ def one_hot_jax(z, K):
     zoh = jnp.reshape(zoh, shp + (K,))
     return zoh
 
-def one_hot_jax2(z, z_prev, K):
-    z = z * K + z_prev
-    z = jnp.atleast_1d(z).astype(int)
-    K2 = K * K
-    shp = z.shape
-    N = z.size
-    zoh = jnp.zeros((N, K2))
-    zoh = zoh.at[jnp.arange(N), jnp.ravel(z)].set(1)
-    zoh = jnp.reshape(zoh, shp + (K2,))
-    return zoh
+def make_xoh(xs_int):
+    '''one-hot state vector'''
+    # (N,T) -> (N,T,1,S)
+    return one_hot_jax(jnp.array(xs_int), S)[:, :, None, :]
 
-def one_hotx_partial(xs):
-    return one_hot_jax(xs[:, None], n_states)
-def one_hotx2_partial(xs, xs_prev):
-    return one_hot_jax2(xs[:, None], xs_prev[:, None], n_states)
-def one_hota_partial(acs):
-    return one_hot_jax(acs[:, None], n_actions)
+def make_aoh(acs_int):
+    # (N,T) -> (N,T,1,A)
+    return one_hot_jax(jnp.array(acs_int), A)[:, :, None, :]
 
-train_xohs = vmap(one_hotx_partial)(train_xs)
-train_xohs2 = vmap(one_hotx2_partial)(train_xs, jnp.roll(train_xs, 1))
-train_aohs = vmap(one_hota_partial)(train_acs)
+def make_hoh(hs_arr):
+    # (N,T,H) -> (N,T,1,H)
+    return jnp.array(hs_arr)[:, :, None, :]
 
-all_xohs = vmap(one_hotx_partial)(xs)
-all_xohs2 = vmap(one_hotx2_partial)(xs, jnp.roll(xs, 1))
-all_aohs = vmap(one_hota_partial)(acs)
+train_xoh = make_xoh(train_xs)
+test_xoh  = make_xoh(test_xs)
+train_aoh = make_aoh(train_acs)
+test_aoh  = make_aoh(test_acs)
+train_hoh = make_hoh(train_hs)
+test_hoh  = make_hoh(test_hs)
 
-test_xohs = vmap(one_hotx_partial)(test_xs)
-test_xohs2 = vmap(one_hotx2_partial)(test_xs, jnp.roll(test_xs, 1))
-test_aohs = vmap(one_hota_partial)(test_acs)
+trans_probs_j = jnp.array(trans_probs)
 
-npr.seed(seed)
-logpi0_start = np.array([0.5, 0.5])
-Ps = .95 * np.eye(K) + .05 * npr.rand(K, K)
-Ps /= Ps.sum(axis=1, keepdims=True)
-log_Ps_start = np.log(Ps)
-Rs_start = np.zeros((C, 1, K))
+# -----------------------------
+# Reward network (paper-style emissions)
+# Input: [onehot(s), h_t]  => (S+H)
+# Output per state: (K*A)  -> reshape to (S,K,A)
+# -----------------------------
+K = 2  # GW5 has two modes
 
-
-from swirl_func import pi0_m_step, trans_m_step_jax_jaxopt
-n_states, n_actions, _ = trans_probs.shape
-
-
-import jax
-import jax.numpy as jnp
-from flax import linen as nn
-from flax.training import train_state
-
-class MLP(nn.Module):
-    subnet_size: int
+class RewardNet(nn.Module):
     hidden_size: int
-    output_size: int
-    n_hidden: int
-    expand: bool
+    K: int
+    A: int
 
-    def setup(self):
-        self.subnet = nn.Dense(self.subnet_size)
-        self.dense1 = nn.Dense(self.hidden_size)
-        # self.dense1b = nn.Dense(5)
-        self.dense2 = nn.Dense(self.n_hidden)
-        if self.expand:
-            self.reshape_func = lambda x: jnp.tile(jnp.expand_dims(x, axis=-1), (1,) * (x.ndim) + (C,)) / C
-        else:
-            self.reshape_func = lambda x: x.reshape(*x.shape[:-1], C, C)
-
+    @nn.compact
     def __call__(self, x):
-        x = self.reshape_func(x)
-        x = jax.vmap(self.subnet, in_axes=-1)(x)
-        x = x.reshape(*x.shape[1:-1], x.shape[0] * x.shape[-1])
-        x = self.dense1(x)
+        x = nn.Dense(self.hidden_size)(x)
         x = nn.leaky_relu(x)
-        x = self.dense2(x) 
+        x = nn.Dense(self.hidden_size)(x)
         x = nn.leaky_relu(x)
-        x = jnp.expand_dims(x, axis=-1)
-        x = jnp.tile(x, (1, self.output_size))
-        return x
+        x = nn.Dense(self.K * self.A)(x)
+        return x  # (S, K*A) when x is (S, S+H)
 
+def create_reward_state(rng, input_size, hidden_size, K, A, lr):
+    model = RewardNet(hidden_size=hidden_size, K=K, A=A)
+    params = model.init(rng, jnp.ones((1, input_size)))["params"]
+    tx = optax.adam(lr)
+    return train_state.TrainState.create(apply_fn=model.apply, params=params, tx=tx)
 
-# Create the model
-def create_model(rng, subnet_size, n_hidden, input_size, hidden_size, output_size, expand):
-    model = MLP(subnet_size=subnet_size, hidden_size=hidden_size, output_size=output_size, n_hidden=n_hidden, expand=expand)
-    params = model.init(rng, jnp.ones((1, input_size)))['params']  # Initialize model params with an example input
-    return model, params
+# -----------------------------
+# Build logemit_list (N,T,K,S,A) using swirl_func.soft_vi_sa
+# -----------------------------
+def build_logemit_list(R_state, hoh, trans_probs_j, discount=0.95, vi_iters=50):
+    """
+    hoh: (N,T,1,H)
+    """
+    S = trans_probs_j.shape[0]
+    eyeS = jnp.eye(S)
 
-# Training state to hold the model parameters and optimizer state
-def create_train_state(rng, subnet_size, learning_rate, n_hidden, input_size, hidden_size, output_size, expand=False):
-    model, params = create_model(rng, subnet_size, n_hidden, input_size, hidden_size, output_size, expand)
-    tx = optax.adam(learning_rate)  # Adam optimizer
-    state = train_state.TrainState.create(apply_fn=model.apply, params=params, tx=tx)
-    return state
+    # squeeze to (N,T,H)
+    hs = hoh[:, :, 0, :]
 
+    def per_t(h_t):
+        # build input (S, S+H)
+        h_rep = jnp.repeat(h_t[None, :], S, axis=0)      # (S,H)
+        inp = jnp.concatenate([eyeS, h_rep], axis=1)     # (S,S+H)
+        out = R_state.apply_fn({"params": R_state.params}, inp)  # (S, K*A)
+        out = out.reshape(S, K, A)                       # (S,K,A)
+        r_ksa = jnp.transpose(out, (1, 0, 2))            # (K,S,A)
 
-rng = jax.random.PRNGKey(0)
-input_size = C*C
-subnet_size = 4
-hidden_size = 16
-output_size = 5
-n_hidden = K
-learning_rate = 5e-3
+        # for each mode k, compute pi_k(s,a) via soft VI on r_sa
+        pi_ksa = vmap(lambda r_sa: soft_vi_sa(trans_probs_j, r_sa, discount=discount, threshold=vi_iters))(r_ksa)
+        return jnp.log(pi_ksa + 1e-20)                   # (K,S,A)
 
-# Initialize the model and training state
-R_state = create_train_state(rng, subnet_size, learning_rate, n_hidden, input_size, hidden_size, output_size, expand=False)
+    def per_traj(h_TH):
+        return vmap(per_t)(h_TH)                         # (T,K,S,A)
 
-R_state2 = create_train_state(rng, subnet_size, learning_rate, n_hidden, input_size, hidden_size, output_size, expand=False)
+    # (N,T,K,S,A)
+    return vmap(per_traj)(hs)
 
-n_state, n_action, _ = trans_probs.shape
-new_trans_probs = np.zeros((n_state * n_state, n_action, n_state * n_state))
-
-# new transition matrix
-for s_prev in range(n_state):
-    for s in range(n_state):
-        for a in range(n_action):
-            for s_prime in range(n_state):
-                if trans_probs[s, a, s_prime] > 0:
-                    new_trans_probs[s * n_state + s_prev, a, s_prime * n_state + s] = trans_probs[s, a, s_prime]
-
-from swirl_func import comp_transP, forward, backward, expected_states, comp_ll_jax, vinet, vinet_expand
-from swirl_func import emit_m_step_jaxnet_optax2, emit_m_step_jaxnet_optax2_expand, jaxnet_e_step_batch2, jaxnet_e_step_batch
-
-def em_train_net2(logpi0, log_Ps, Rs, R_state, iter=100, init=True, trans=True, emit=True):
+# -----------------------------
+# EM training
+# -----------------------------
+def em_train(logpi0, log_Ps, Rs, R_state, iters=50, trans_iters=200, emit_iters=200):
     LL_list = []
-    for i in range(iter):
-        print(i)
+    for it in range(iters):
         pi0 = jnp.exp(logpi0 - jax_logsumexp(logpi0))
-        all_gamma_jax, all_xi_jax, all_jax_alphas = jaxnet_e_step_batch2(pi0, log_Ps, Rs, R_state, new_trans_probs, train_xohs, train_xohs2, train_aohs)
-        print(jnp.sum(jax_logsumexp(all_jax_alphas[:, -1], axis=-1)))
 
-        if init == True:
-            print("gamma shape:", np.array(all_gamma_jax).shape)
-            print("gamma[0,0,:]:", np.array(all_gamma_jax)[0, 0, :])
-            print("gamma min/max:", np.min(all_gamma_jax), np.max(all_gamma_jax))
+        logemit_train = build_logemit_list(R_state, train_hoh, trans_probs_j, discount=0.95, vi_iters=50)
 
-            new_logpi0 = pi0_m_step(all_gamma_jax)
-        else:
-            new_logpi0 = logpi0
-        print(new_logpi0)
+        # E-step (from swirl_func)
+        gamma, xi, alpha = jaxnet_e_step_batch2(
+            pi0,
+            log_Ps,
+            Rs,
+            trans_probs_j,
+            train_xoh,   # transitions condition on xoh
+            train_xoh,   # emissions also use xoh (keep split but same)
+            train_aoh,
+            logemit_train
+        )
 
-        if trans == True:
-            new_log_Ps, new_Rs = trans_m_step_jax_jaxopt(log_Ps, Rs, (all_gamma_jax, all_xi_jax), jnp.array(train_xohs))
-        else:
-            new_log_Ps, new_Rs = log_Ps, Rs
+        # dataset LL = sum over traj log p(x,a)
+        LL = jnp.sum(jax_logsumexp(alpha[:, -1, :], axis=-1))
+        LL_list.append(float(LL))
+        print(it)
+        print(LL)
 
-        if emit == True:
-            new_R_state = emit_m_step_jaxnet_optax2_expand(R_state, jnp.array(trans_probs), all_gamma_jax, jnp.array(train_xohs), jnp.array(train_aohs), num_iters=800)
-            new_R_state = emit_m_step_jaxnet_optax2(new_R_state, jnp.array(new_trans_probs), all_gamma_jax, jnp.array(train_xohs2), jnp.array(train_aohs), num_iters=200)
-        else:
-            new_R_state = R_state
-        LL_list.append(jnp.sum(jax_logsumexp(all_jax_alphas[:, -1], axis=-1)))
-        logpi0, log_Ps, Rs, R_state = new_logpi0, new_log_Ps, new_Rs, new_R_state
+        # M-step pi0
+        logpi0 = pi0_m_step(gamma)
+
+        # M-step transitions (from swirl_func)
+        log_Ps, Rs = trans_m_step_jax_optax(
+            log_Ps, Rs,
+            (gamma, xi),
+            train_xoh,
+            num_iters=trans_iters,
+            learning_rate=5e-3
+        )
+
+        # M-step emissions/reward net (from swirl_func)
+        R_state = emit_m_step_jaxnet_optax2(
+            R_state,
+            trans_probs_j,
+            gamma,
+            train_xoh,
+            train_aoh,
+            train_hoh,
+            num_iters=emit_iters,
+            batch_size = 16,
+            discount=0.95,
+            vi_threshold=50,
+            lr=3e-4
+        )
+
     return logpi0, log_Ps, Rs, R_state, LL_list
 
-def em_train_net(logpi0, log_Ps, Rs, R_state, iter=100, init=True, trans=True, emit=True):
-    LL_list = []
-    for i in range(iter):
-        print(i)
-        pi0 = jnp.exp(logpi0 - jax_logsumexp(logpi0))
-        all_gamma_jax, all_xi_jax, all_jax_alphas = jaxnet_e_step_batch(pi0, log_Ps, Rs, R_state, trans_probs, train_xohs, train_aohs)
-        print(jnp.sum(jax_logsumexp(all_jax_alphas[:, -1], axis=-1)))
+# init params
+rng = jax.random.PRNGKey(seed)
+H = train_hs.shape[-1]
+input_size = S + H
+R_state = create_reward_state(rng, input_size, hidden_size=64, K=K, A=A, lr=3e-4)
 
-        if init == True:
-            new_logpi0 = pi0_m_step(all_gamma_jax)
-        else:
-            new_logpi0 = logpi0
-        print(new_logpi0)
+import numpy.random as npr
+npr.seed(seed)
 
-        if trans == True:
-            new_log_Ps, new_Rs = trans_m_step_jax_jaxopt(log_Ps, Rs, (all_gamma_jax, all_xi_jax), jnp.array(train_xohs))
-        else:
-            new_log_Ps, new_Rs = log_Ps, Rs
+logpi0_start = jnp.log(jnp.array([0.5, 0.5]))
 
-        if emit == True:
-            new_R_state = emit_m_step_jaxnet_optax2_expand(R_state, jnp.array(trans_probs), all_gamma_jax, jnp.array(train_xohs), jnp.array(train_aohs), num_iters=800)
-        else:
-            new_R_state = R_state
-        LL_list.append(jnp.sum(jax_logsumexp(all_jax_alphas[:, -1], axis=-1)))
-        logpi0, log_Ps, Rs, R_state = new_logpi0, new_log_Ps, new_Rs, new_R_state
-    return logpi0, log_Ps, Rs, R_state, LL_list
+Ps = 0.95 * np.eye(K) + 0.05 * npr.rand(K, K)
+Ps /= Ps.sum(axis=1, keepdims=True)
+log_Ps_start = jnp.log(jnp.array(Ps))
 
-from jax.lib import xla_bridge
-print(xla_bridge.get_backend().platform)
+Rs_start = jnp.zeros((S, 1, K))  # this matches comp_log_transP's dot(x, Rs[:,0,:]) usage
 
 
+new_logpi0, new_log_Ps, new_Rs, new_R_state, LL_list = em_train(
+    logpi0_start, log_Ps_start, Rs_start, R_state,
+    iters=50, trans_iters=200, emit_iters=200
+)
 
+# -----------------------------
+# Quantitative evaluation (your requested 5 numbers)
+# -----------------------------
+def mode_acc(gamma, z_true):
+    z_hat = np.argmax(np.array(gamma), axis=-1)
 
-new_logpi0, new_log_Ps, new_Rs, new_R_state, LL_list = em_train_net2(jnp.array(logpi0_start), jnp.array(log_Ps_start), jnp.array(Rs_start), R_state, 50)
-jnp.savez(save_folder + '/' + str(seed) + 'Long_NM_gw5_net2.npz', new_logpi0=new_logpi0, new_log_Ps=new_log_Ps, new_Rs=new_Rs, new_R_state=new_R_state.params, LL_list=LL_list)
+    # permutation-invariant for K=2
+    acc = np.mean(z_hat == z_true)
+    acc_flip = np.mean((1 - z_hat) == z_true)
 
+    # helpful debug: class balance + confusion-ish counts
+    p1 = np.mean(z_true == 1)
+    print(f"[DEBUG acc] frac(z_true==1)={p1:.3f}, acc={acc:.3f}, acc_flip={acc_flip:.3f}")
 
-from swirl_func import _viterbi_JAX
-def comp_LLloss(pi0, trans_Ps, lls):
-    alphas_list = vmap(partial(forward, jnp.array(pi0)))(trans_Ps, lls)
-    print(alphas_list.shape)
-    return jnp.sum(jax_logsumexp(alphas_list[:, -1], axis=-1))
-def learnt_LL1(logpi0, log_Ps, Rs, params, apply_fn):
-    pi0 = jnp.exp(logpi0 - jax_logsumexp(logpi0))
-    pi, _, _ = vinet_expand(trans_probs, params, apply_fn)
-    logemit = jnp.log(pi)
-    new_lls_jax_vmap = vmap(partial(comp_ll_jax, logemit))(jnp.array(all_xohs), jnp.array(all_aohs))
-    new_trans_Ps_vmap = vmap(partial(comp_transP, jnp.array(log_Ps), jnp.array(Rs)))(jnp.array(all_xohs))
-    new_lls_jax_vmap_test = vmap(partial(comp_ll_jax, logemit))(jnp.array(test_xohs), jnp.array(test_aohs))
-    new_trans_Ps_vmap_test = vmap(partial(comp_transP, jnp.array(log_Ps), jnp.array(Rs)))(jnp.array(test_xohs))
-    jax_path_vmap = vmap(partial(_viterbi_JAX, jnp.array(pi0)))(jnp.array(new_trans_Ps_vmap), jnp.array(new_lls_jax_vmap))
-    jax_path_vmap_test = vmap(partial(_viterbi_JAX, jnp.array(pi0)))(jnp.array(new_trans_Ps_vmap_test), jnp.array(new_lls_jax_vmap_test))
-    return comp_LLloss(pi0, new_trans_Ps_vmap, new_lls_jax_vmap) / (all_xohs.shape[0]*all_xohs.shape[1]), comp_LLloss(pi0, new_trans_Ps_vmap_test, new_lls_jax_vmap_test) / (test_xohs.shape[0]*test_xohs.shape[1]), jax_path_vmap, jax_path_vmap_test
-def learnt_LL2(logpi0, log_Ps, Rs, params, apply_fn):
-    pi0 = jnp.exp(logpi0 - jax_logsumexp(logpi0))
-    pi, _, _ = vinet(new_trans_probs, params, apply_fn)
-    logemit = jnp.log(pi)
-    new_lls_jax_vmap = vmap(partial(comp_ll_jax, logemit))(jnp.array(all_xohs2), jnp.array(all_aohs))
-    new_trans_Ps_vmap = vmap(partial(comp_transP, jnp.array(log_Ps), jnp.array(Rs)))(jnp.array(all_xohs))
-    new_lls_jax_vmap_test = vmap(partial(comp_ll_jax, logemit))(jnp.array(test_xohs2), jnp.array(test_aohs))
-    new_trans_Ps_vmap_test = vmap(partial(comp_transP, jnp.array(log_Ps), jnp.array(Rs)))(jnp.array(test_xohs))
-    jax_path_vmap = vmap(partial(_viterbi_JAX, jnp.array(pi0)))(jnp.array(new_trans_Ps_vmap), jnp.array(new_lls_jax_vmap))
-    jax_path_vmap_test = vmap(partial(_viterbi_JAX, jnp.array(pi0)))(jnp.array(new_trans_Ps_vmap_test), jnp.array(new_lls_jax_vmap_test))
-    return comp_LLloss(pi0, new_trans_Ps_vmap, new_lls_jax_vmap) / (all_xohs.shape[0]*all_xohs.shape[1]), comp_LLloss(pi0, new_trans_Ps_vmap_test, new_lls_jax_vmap_test) / (test_xohs.shape[0]*test_xohs.shape[1]), jax_path_vmap, jax_path_vmap_test
+    return float(max(acc, acc_flip))
 
-from gw5_analysis import get_reward_nm, get_reward_m, compute_accuracy, calibrate_reward, best_perm_corr
-reward_nm2 = get_reward_nm(new_trans_probs, new_R_state.params, new_R_state.apply_fn)
-ll2, tll2, learnt_zs2, learnt_zs2_test = learnt_LL2(new_logpi0, new_log_Ps, new_Rs, new_R_state.params, new_R_state.apply_fn)
-acc2 = compute_accuracy(learnt_zs2, zs)
-test_acc2 = compute_accuracy(learnt_zs2_test, test_zs)
+def mode_metrics(gamma, z_true):
+    z_hat = np.argmax(np.array(gamma), axis=-1)
 
-RG = np.load(folder + '/RG.npy')
-invalid_transitions = np.all(trans_probs == 0, axis=1)
-RG_filtered = np.copy(RG)
-RG_filtered[:, invalid_transitions] = np.nan
-reward_nm2_filtered = np.copy(reward_nm2).mean(-1).reshape((K, C, C))
-reward_nm2_filtered[:, invalid_transitions] = np.nan
-reward_nm2_filtered = calibrate_reward(reward_nm2_filtered, RG_filtered)
-best_corr2, reward_nm2_filtered = best_perm_corr(RG_filtered, reward_nm2_filtered)
+    # permutation invariant for K=2
+    acc = np.mean(z_hat == z_true)
+    acc_flip = np.mean((1 - z_hat) == z_true)
+    if acc_flip > acc:
+        z_hat = 1 - z_hat
+        acc = acc_flip
 
-print('S2 acc:', acc2, 'S2 test acc:', test_acc2, 'S2 R corr:', best_corr2)
+    # confusion
+    tp = np.sum((z_hat == 1) & (z_true == 1))
+    tn = np.sum((z_hat == 0) & (z_true == 0))
+    fp = np.sum((z_hat == 1) & (z_true == 0))
+    fn = np.sum((z_hat == 0) & (z_true == 1))
 
+    tpr = tp / (tp + fn + 1e-9)  # recall for class 1
+    tnr = tn / (tn + fp + 1e-9)  # recall for class 0
+    bal_acc = 0.5 * (tpr + tnr)
 
-new_logpi0, new_log_Ps, new_Rs, new_R_state, LL_list = em_train_net(jnp.array(logpi0_start), jnp.array(log_Ps_start), jnp.array(Rs_start), R_state2, 50)
-jnp.savez(save_folder + '/' + str(seed) + 'Long_NM_gw5_net1.npz', new_logpi0=new_logpi0, new_log_Ps=new_log_Ps, new_Rs=new_Rs, new_R_state=new_R_state.params, LL_list=LL_list)
+    prec = tp / (tp + fp + 1e-9)
+    f1 = 2 * prec * tpr / (prec + tpr + 1e-9)
 
-reward_m1 = get_reward_m(trans_probs, new_R_state.params, new_R_state.apply_fn)
-ll1, tll1, learnt_zs1, learnt_zs1_test = learnt_LL1(new_logpi0, new_log_Ps, new_Rs, new_R_state.params, new_R_state.apply_fn)
-acc1 = compute_accuracy(learnt_zs1, zs)
-test_acc1 = compute_accuracy(learnt_zs1_test, test_zs)
-reward_m1_filtered = np.copy(reward_m1).mean(-1).reshape((K, C))[:, :, None]
-reward_m1_filtered = np.tile(reward_m1_filtered, (1, 1, C))
-reward_m1_filtered = calibrate_reward(reward_m1_filtered, RG_filtered)
-best_corr1, reward_m1_filtered = best_perm_corr(RG_filtered, reward_m1_filtered)
+    return acc, bal_acc, f1, (tp, fp, fn, tn)
 
-print('S1 acc:', acc1, 'S1 test acc:', test_acc1, 'S1 R corr:', best_corr1)
+# train acc
+pi0 = jnp.exp(new_logpi0 - jax_logsumexp(new_logpi0))
+logemit_train = build_logemit_list(new_R_state, train_hoh, trans_probs_j)
+train_gamma, _, train_alpha = jaxnet_e_step_batch2(pi0, new_log_Ps, new_Rs, trans_probs_j,
+                                                   train_xoh, train_xoh, train_aoh, logemit_train)
+acc1 = mode_acc(train_gamma, train_zs)
+acc, bal_acc, f1, conf = mode_metrics(train_gamma, train_zs)
 
+# test acc + loglik
+logemit_test = build_logemit_list(new_R_state, test_hoh, trans_probs_j)
+test_gamma, _, test_alpha = jaxnet_e_step_batch2(pi0, new_log_Ps, new_Rs, trans_probs_j,
+                                                 test_xoh, test_xoh, test_aoh, logemit_test)
+test_acc1 = mode_acc(test_gamma, test_zs)
 
+per_traj = float(jnp.mean(jax_logsumexp(test_alpha[:, -1, :], axis=-1)))
+T = test_alpha.shape[1]
+per_step = per_traj / float(T)
 
+# reward correlation (time-averaged predicted reward vs RG)
 
+best_corr1 = float("nan")
+rg_path = os.path.join(data_folder, "RG.npy")
+if os.path.exists(rg_path):
+    RG = np.load(rg_path, allow_pickle=True)  # expect (K,S,A) or compatible
+    RG = np.asarray(RG)
 
+    # compute time-averaged predicted rewards:
+    # for each (n,t): out is (S,K,A)
+    S_ = S
+    eyeS = jnp.eye(S_)
+
+    def rewards_from_h(h_t):
+        h_rep = jnp.repeat(h_t[None, :], S_, axis=0)
+        inp = jnp.concatenate([eyeS, h_rep], axis=1)
+        out = new_R_state.apply_fn({"params": new_R_state.params}, inp)  # (S,K*A)
+        out = out.reshape(S_, K, A)
+        return out  # (S,K,A)
+
+    # (N,T,S,K,A)
+    R_pred = vmap(vmap(rewards_from_h))(train_hoh[:, :, 0, :])
+    # average over (n,t) -> (S,K,A)
+    R_avg = np.array(jnp.mean(R_pred, axis=(0, 1)))
+    # reorder to (K,S,A)
+    R_avg = np.transpose(R_avg, (1, 0, 2))
+
+    if RG.shape != R_avg.shape:
+        # try to coerce if RG is (K,S,S) from older code (state-state reward); then correlation is not meaningful
+        # We'll only compute corr when shapes match.
+        best_corr1 = float("nan")
+    else:
+        best_corr1 = float(np.corrcoef(R_avg.flatten(), RG.flatten())[0, 1])
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         
+print("[DEBUG R_corr] RG shape:", None if RG is None else RG.shape)
+print("[DEBUG R_corr] R_avg shape:", R_avg.shape)
+print("[DEBUG R_corr] std RG:", None if RG is None else float(np.std(RG)))
+print("[DEBUG R_corr] std R_avg:", float(np.std(R_avg)))
+
+print("S1:",
+      "acc", acc1,
+      "[DEBUG metrics] acc=", acc, "bal_acc=", bal_acc, "f1=", f1, "conf(tp,fp,fn,tn)=", conf,
+      "test_acc", test_acc1,
+      "R_corr", best_corr1,
+      "test_loglik_per_traj", per_traj, "test_loglik_per_step", per_step, "T", int(T))
+
+# Save
+out_path = os.path.join(save_folder, f"{seed}_gw5_ht_paperstyle_from_swirl_func.npz")
+np.savez(out_path,
+         new_logpi0=np.array(new_logpi0),
+         new_log_Ps=np.array(new_log_Ps),
+         new_Rs=np.array(new_Rs),
+         LL_list=np.array(LL_list))
+print("Saved:", out_path)
