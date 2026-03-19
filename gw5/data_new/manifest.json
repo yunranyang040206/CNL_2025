@@ -1,0 +1,13 @@
+{
+    "seed": 42,
+    "N": 200,
+    "T": 500,
+    "grid_size": 5,
+    "water_state": 24,
+    "delta": 0.03,
+    "threshold": 0.5,
+    "tau": 1.0,
+    "discount": 0.95,
+    "vi_iters": 50,
+    "alignment": "a_t moves x_t to x_{t+1}"
+}
