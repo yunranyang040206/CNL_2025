@@ -1,0 +1,35 @@
+Latent Social Drive Profiles
+dataset=compressed
+K=2
+model=net2
+seeds=[30]
+reward_extractor=expanded
+include_self=False
+
+Mode occupancy (mean ± std across seeds)
+  h1: 0.7432 ± 0.0000
+  h2: 0.2568 ± 0.0000
+
+Reward-drive matrix (mean ± std)
+  h1: Attack=-1.0867±0.0000, Investigation=4.4647±0.0000, Mount=-7.8818±0.0000, Other=-0.9172±0.0000
+  h2: Attack=-0.6570±0.0000, Investigation=1.3748±0.0000, Mount=-3.4997±0.0000, Other=-0.8066±0.0000
+
+Policy-drive matrix (mean ± std)
+  h1: Attack=0.0145±0.0000, Investigation=0.7196±0.0000, Mount=0.0221±0.0000, Other=0.5771±0.0000
+  h2: Attack=0.0429±0.0000, Investigation=0.6659±0.0000, Mount=0.1842±0.0000, Other=0.4403±0.0000
+
+Empirical next-behavior frequency by Viterbi mode (mean ± std)
+  h1: Attack=0.0183±0.0000, Investigation=0.5067±0.0000, Mount=0.0354±0.0000, Other=0.4396±0.0000
+  h2: Attack=0.0919±0.0000, Investigation=0.4134±0.0000, Mount=0.1943±0.0000, Other=0.3004±0.0000
+
+Reward-drive rankings by behavior (best mode first)
+  Attack: [2, 1]
+  Investigation: [1, 2]
+  Mount: [2, 1]
+  Other: [2, 1]
+
+Policy-drive rankings by behavior (best mode first)
+  Attack: [2, 1]
+  Investigation: [1, 2]
+  Mount: [2, 1]
+  Other: [1, 2]

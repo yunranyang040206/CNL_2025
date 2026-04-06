@@ -1,0 +1,29 @@
+Persistence / Commitment Metric
+dataset=standard
+K=2
+model=net2
+seeds=[30]
+reward_extractor=expanded
+bout_mode=onset
+
+Correlation with mean bout length
+  reward_self_vs_mean_length: 0.7792
+  policy_self_vs_mean_length: 0.5506
+
+Correlation with median bout length
+  reward_self_vs_median_length: 0.4935
+  policy_self_vs_median_length: 0.6830
+
+Per-mode, per-behavior summary
+
+h1
+  Attack: reward_self=1.3631, policy_self=0.9938, mean_len=91.929, median_len=56.500, count=14
+  Investigation: reward_self=1.6474, policy_self=0.9913, mean_len=125.518, median_len=59.000, count=367
+  Mount: reward_self=1.3691, policy_self=0.9861, mean_len=101.386, median_len=77.000, count=70
+  Other: reward_self=1.6510, policy_self=0.9977, mean_len=147.467, median_len=81.000, count=396
+
+h2
+  Attack: reward_self=1.3374, policy_self=0.9831, mean_len=71.917, median_len=67.500, count=24
+  Investigation: reward_self=1.4234, policy_self=0.9914, mean_len=30.113, median_len=23.000, count=97
+  Mount: reward_self=1.3722, policy_self=0.9981, mean_len=56.278, median_len=39.000, count=18
+  Other: reward_self=1.2742, policy_self=0.9085, mean_len=22.636, median_len=1.000, count=66
