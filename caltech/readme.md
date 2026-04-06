@@ -39,7 +39,7 @@ All files with suffix `2` correspond to **Task 2**:
 
 ### 4. Results (`results/`)
 - New files correspond to:
-  - Methods 1–3 (interpretability analyses)
+  - Methods 1–4 (interpretability analyses)
   - Task 2 dataset
   - K = 2 only
 
