@@ -1,22 +1,50 @@
-Update on CalMS21 S-2 analysis (K = 2 only):
+## CalMS21 S-2 Analysis Update (K = 2)
 
-1. In swirl/:
-Added new interpretability analysis scripts:
-- social_drive_profiles.py → Method 1 (latent social drive profiles)
-- escalation_potential.py → Method 2 (escalation potential)
-- persistence_commitment.py → Method 3 (persistence / commitment)
+### 1. New Analysis Scripts (`swirl/`)
+Added interpretability evaluation modules:
+- `social_drive_profiles.py` → Method 1: latent social drive profiles  
+- `escalation_potential.py` → Method 2: escalation potential  
+- `persistence_commitment.py` → Method 3: persistence / commitment  
 
-2. In data/:
-- Added task2_classic_classification/, which corresponds to CalMS21 Task 2
-- Same behavior categories as Task 1, but includes 6 annotators (annotation-style variation)
+---
 
-3. New Task 2 processed / model files:
-- All ARHMM outputs ending with “2” (e.g. *_caltech2.npz, *_caltech_compressed2.npz) are for Task 2
-- compressed_seqs2.npy and compressed_trans_probs2.npy are also Task 2 versions
+### 2. Task 2 Dataset (`data/`)
+⚠️ Not included in the repo due to size limits.
 
-4. Results:
-- Any new files in results/ correspond to the new analyses (Methods 1–3) on Task 2
+- Dataset: `task2_annotation_styles.zip`  
+- Download link: https://data.caltech.edu/records/s0vdx-0k302  
 
-5. Notes:
-- No modification to existing Task 1 pipeline
-- All analysis currently run only for K = 2
+After downloading:
+- Extract into `data/`
+- Folder used: `task2_classic_classification/`
+
+Details:
+- Same behavior categories as Task 1  
+- Includes **6 annotators** (used for annotation-style analysis)
+
+---
+
+### 3. Task 2 Processed / Model Files
+All files with suffix `2` correspond to **Task 2**:
+
+- ARHMM outputs:
+  - `*_caltech2.npz`
+  - `*_caltech_compressed2.npz`
+
+- Processed data:
+  - `compressed_seqs2.npy`
+  - `compressed_trans_probs2.npy`
+
+---
+
+### 4. Results (`results/`)
+- New files correspond to:
+  - Methods 1–3 (interpretability analyses)
+  - Task 2 dataset
+  - K = 2 only
+
+---
+
+### 5. Notes
+- No changes to existing Task 1 pipeline  
+- All experiments currently restricted to **K = 2** for consistency and interpretability focus  
