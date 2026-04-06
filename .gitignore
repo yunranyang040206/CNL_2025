@@ -1,2 +1,5 @@
 .vscode
 .agent
+caltech/data/*.json
+caltech/data/*/*.json
+caltech/data/*/*/*.json
