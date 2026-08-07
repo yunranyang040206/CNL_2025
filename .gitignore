@@ -1,5 +1,26 @@
-.vscode
-.agent
+.vscode/
+.agent/
+
+__pycache__/
+*.py[cod]
+
+# Local dataset copies and generated training data.
+SWIRL-caltech/
 caltech/data/*.json
 caltech/data/*/*.json
 caltech/data/*/*/*.json
+labyrinth/data_new/
+labyrinth/data_old/
+trajectories/data/
+trajectories/data_new/
+trajectories/data_new0/
+trajectories/data_softvi/
+
+# Generated experiment output. Keep the compact initial GW5 result bundle.
+labyrinth/results/
+trajectories/output/*
+!trajectories/output/swirl_result/
+trajectories/output/swirl_result/*
+!trajectories/output/swirl_result/gw5/
+!trajectories/output/swirl_result/gw5/**
+trajectories/output/swirl_result/gw5/__pycache__/

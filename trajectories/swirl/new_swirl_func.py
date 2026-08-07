@@ -1,15 +1,3 @@
-"""History-dependent SWIRL architecture for labyrinth mouse data.
-
-This cleaned version keeps the GW5-style h_t-conditioned reward/inference structure,
-removes duplicate overridden definitions, removes GW5-specific hardcoded goal assumptions,
-and adds padding-aware handling for variable-length labyrinth trajectories.
-
-Key conventions:
-- trajectories are unsupervised (no ground-truth modes or rewards assumed)
-- per-trajectory state/action arrays may contain padded suffixes
-- padded timesteps are ignored in E-step and reward M-step
-"""
-
 import numpy as np
 import numpy.random as npr
 from scipy.special import logsumexp
@@ -24,7 +12,7 @@ from jax import lax, vmap, jit
 from functools import partial
 from jax.scipy.special import logsumexp as jax_logsumexp
 import optax
-jax.config.update("jax_enable_x64", False)
+jax.config.update("jax_enable_x64", True)
 # jax.config.update("jax_platform_name", "cpu")
 
 def _safe_normalize(v, axis=-1, eps=1e-12):
@@ -43,6 +31,22 @@ def _log_from_probs(p, eps=1e-12):
     p = jnp.clip(p, eps, 1.0)
     p = p / jnp.sum(p, axis=-1, keepdims=True)
     return jnp.log(p)
+
+def make_goal_absorbing(trans_probs, goal_state=24):
+    """Return a copy of trans_probs with the goal state made absorbing.
+
+    For the goal state, every action deterministically transitions back to the
+    goal state. This only changes planning dynamics; it does not alter rewards.
+    """
+    tp = jnp.array(trans_probs)
+    S, A, _ = tp.shape
+    if goal_state is None:
+        return tp
+    if goal_state < 0 or goal_state >= S:
+        raise ValueError(f"goal_state={goal_state} out of bounds for S={S}")
+
+    goal_row = jnp.zeros((A, S), dtype=tp.dtype).at[:, goal_state].set(1.0)
+    return tp.at[goal_state, :, :].set(goal_row)
 
 def soft_vi_sa(trans_probs, reward_sa, discount=0.95, threshold=100):
     # trans_probs: (S,A,S), reward_sa: (S,A)
@@ -464,6 +468,186 @@ def structured_q_marginals(node_logits_tk, edge_logits_tkk):
     return gamma, xi, alpha
 
 @jax.jit
+def amortized_e_step_batch(inf_state, hoh_batch, xoh_batch, aoh_batch):
+    '''Student E-step using structured q(z|h,x,a).'''
+    hoh = jnp.array(hoh_batch)
+    if hoh.ndim == 4 and hoh.shape[2] == 1:
+        hoh = hoh[:, :, 0, :]
+
+    xoh = jnp.array(xoh_batch)
+    if xoh.ndim == 4 and xoh.shape[2] == 1:
+        xoh = xoh[:, :, 0, :]
+
+    aoh = jnp.array(aoh_batch)
+    if aoh.ndim == 4 and aoh.shape[2] == 1:
+        aoh = aoh[:, :, 0, :]
+
+    def per_traj(h_TH, x_TS, a_TA):
+        node_logits_tk, edge_logits_tkk = inf_state.apply_fn(
+            {'params': inf_state.params},
+            h_TH, x_TS, a_TA,
+            train=False
+        )
+        gamma, xi, alpha = structured_q_marginals(node_logits_tk, edge_logits_tkk)
+        return gamma, xi, alpha
+
+    return jax.vmap(per_traj)(hoh, xoh, aoh)
+
+def semi_amortized_e_step_batch(
+    inf_state,
+    hoh_batch, xoh_batch, aoh_batch,
+    logemit_batch,
+    pi0, log_Ps, Rs, trans_probs_j,
+    lam_edge=0.5,
+    lam_node=0.0,
+    lam_prior=0.0,
+    mode_prior=None,
+    # --- Step F knobs ---
+    trust_gate=True,          # use entropy-based trust gating
+    trust_temp=1.0,           # >1 makes gate softer; <1 sharper
+    trust_floor=0.0,          # minimum trust (0.0 = can fully ignore student)
+    trust_cap=1.0,            # maximum trust
+    eta_post=0.0,             # optional posterior blending strength (0 disables)
+    eps=1e-8
+):
+    """
+    Semi-amortized E-step (EDGE + NODE + optional MODE PRIOR) with Step F:
+
+      - EDGE: bias transitions using student q_phi(z_t | z_{t-1}, h,x,a)
+      - NODE: bias node evidence using student q_phi(z_t | h,x,a)
+      - PRIOR: bias node evidence toward a target marginal over modes
+      - Step F: trust-weight student guidance; optional blending of teacher posterior with student posterior
+
+    Returns:
+      gamma: (N,T,K)
+      xi:    (N,T-1,K,K)
+      alpha: (N,T,K)
+    """
+    hoh = jnp.array(hoh_batch)
+    if hoh.ndim == 4 and hoh.shape[2] == 1:
+        hoh = hoh[:, :, 0, :]
+
+    xoh = jnp.array(xoh_batch)      # (N,T,1,S) expected by comp_transP/comp_ll
+    aoh = jnp.array(aoh_batch)
+    logemit = jnp.array(logemit_batch)
+
+    # actions for ll: (N,T,A)
+    aoh_ll = aoh
+    if aoh_ll.ndim == 4 and aoh_ll.shape[2] == 1:
+        aoh_ll = aoh_ll[:, :, 0, :]
+
+    pi0 = jnp.array(pi0)
+    log_Ps = jnp.array(log_Ps)
+    Rs = jnp.array(Rs)
+
+    # infer K from logemit (N,T,K,S,A)
+    K = logemit.shape[2]
+    if mode_prior is None:
+        mode_prior = jnp.ones((K,), dtype=logemit.dtype) / K
+    mode_prior = jnp.array(mode_prior, dtype=logemit.dtype)
+    mode_prior = mode_prior / (jnp.sum(mode_prior) + eps)
+    log_mode_prior = jnp.log(mode_prior + eps)  # (K,)
+    logK = jnp.log(jnp.array(K, dtype=logemit.dtype) + eps)
+
+    lam_edge_j = jnp.array(lam_edge, dtype=logemit.dtype)
+    lam_node_j = jnp.array(lam_node, dtype=logemit.dtype)
+    lam_prior_j = jnp.array(lam_prior, dtype=logemit.dtype)
+    eta_post_j = jnp.array(eta_post, dtype=logemit.dtype)
+
+    trust_temp_j = jnp.array(trust_temp, dtype=logemit.dtype)
+    trust_floor_j = jnp.array(trust_floor, dtype=logemit.dtype)
+    trust_cap_j = jnp.array(trust_cap, dtype=logemit.dtype)
+
+    def _entropy_from_logp(logp, axis=-1):
+        p = jnp.exp(logp)
+        return -jnp.sum(p * logp, axis=axis)
+
+    def _trust_from_ent(ent):
+        # normalized entropy in [0,1] using logK, then invert => confidence
+        # confidence = 1 - H/logK, then soften with trust_temp
+        conf = 1.0 - ent / (logK + eps)
+        # soften/sharpen
+        conf = jnp.clip(conf, 0.0, 1.0)
+        conf = conf ** (1.0 / (trust_temp_j + eps))
+        # clamp
+        return jnp.clip(conf, trust_floor_j, trust_cap_j)
+
+    def per_traj(h_TH, x_T1S, a_TA, logemit_TKSA):
+        # --- teacher transitions P_theta(z_t|z_{t-1}, x_{t-1})
+        Ps = comp_transP(log_Ps, Rs, x_T1S)  # (T-1,K,K)
+
+        # --- teacher log-likelihood log p(a_t | x_t, z_t, h_t)
+        log_likes = comp_ll_jax_timevary(logemit_TKSA, x_T1S, a_TA)  # (T,K)
+
+        # --- student logits (depend on h_TH!)
+        x_TS = x_T1S[:, 0, :]  # (T,S)
+        node_logits_tk, edge_logits_tkk = inf_state.apply_fn(
+            {'params': inf_state.params}, h_TH, x_TS, a_TA, train=False
+        )
+
+        # student posteriors
+        log_qnode = jax.nn.log_softmax(node_logits_tk, axis=-1)      # (T,K)
+        qnode = jnp.exp(log_qnode)
+
+        log_qtrans = jax.nn.log_softmax(edge_logits_tkk, axis=-1)    # (T-1,K,K)
+        qtrans = jnp.exp(log_qtrans)
+
+        # --- Step F trust gating (per time-step)
+        if trust_gate:
+            ent_node = _entropy_from_logp(log_qnode, axis=-1)        # (T,)
+            trust_node = _trust_from_ent(ent_node)                   # (T,)
+
+            # edge: entropy over next-state distribution for each prev-state
+            ent_edge = _entropy_from_logp(log_qtrans, axis=-1)        # (T-1,K)
+            trust_edge = _trust_from_ent(jnp.mean(ent_edge, axis=-1)) # (T-1,)
+        else:
+            trust_node = jnp.ones((log_qnode.shape[0],), dtype=logemit.dtype)
+            trust_edge = jnp.ones((log_qtrans.shape[0],), dtype=logemit.dtype)
+
+        # EDGE: bias transitions (trust-weighted)
+        if lam_edge != 0.0:
+            logPs_tilde = jnp.log(Ps + eps) + (lam_edge_j * trust_edge)[:, None, None] * log_qtrans
+            Ps = jax.nn.softmax(logPs_tilde, axis=-1)
+
+        # NODE: bias node evidence (trust-weighted)
+        if lam_node != 0.0:
+            log_likes = log_likes + (lam_node_j * trust_node)[:, None] * log_qnode
+
+        # PRIOR: bias node evidence toward target marginal (anti-collapse)
+        if lam_prior != 0.0:
+            log_likes = log_likes + lam_prior_j * log_mode_prior[None, :]
+
+        # forward-backward (teacher)
+        alpha = forward(pi0, Ps, log_likes)
+        beta = backward(Ps, log_likes)
+        gamma, xi = expected_states(alpha, beta, Ps, log_likes)
+
+        # --- Step F (optional): posterior blending with student posteriors
+        # Blend only if eta_post > 0, and use trust_node/trust_edge as safety.
+        if eta_post != 0.0:
+            eta_t = jnp.clip(eta_post_j * trust_node, 0.0, 1.0)              # (T,)
+            gamma = (1.0 - eta_t)[:, None] * gamma + eta_t[:, None] * qnode
+            gamma = gamma / (jnp.sum(gamma, axis=-1, keepdims=True) + eps)
+
+            # xi blend with qtrans * gamma_prev approx (keeps shape consistent)
+            # build a "student xi" proxy: xiS[t,i,j] = gamma[t,i] * qtrans[t,i,j]
+            xiS = gamma[:-1, :, None] * qtrans                              # (T-1,K,K)
+            eta_e = jnp.clip(eta_post_j * trust_edge, 0.0, 1.0)              # (T-1,)
+            xi = (1.0 - eta_e)[:, None, None] * xi + eta_e[:, None, None] * xiS
+            xi = xi / (jnp.sum(xi, axis=(-2, -1), keepdims=True) + eps)
+
+        return gamma, xi, alpha
+
+    # For aoh: need (N,T,A) for per_traj
+    a_for_net = aoh
+    if a_for_net.ndim == 4 and a_for_net.shape[2] == 1:
+        a_for_net = a_for_net[:, :, 0, :]
+
+    gamma, xi, alpha = jax.vmap(per_traj)(hoh, xoh, a_for_net, logemit)
+    return gamma, xi, alpha
+
+
+@jax.jit
 def distill_step(
     inf_state,
     hoh, xoh, aoh,
@@ -578,6 +762,27 @@ def distill_step(
     return inf_state, loss, aux
 
 
+
+def jaxnet_e_step_logpi2(pi0, log_Ps, Rs, logemit, trans_probs, xoh, xoh2, aoh):
+    """
+    Same as jaxnet_e_step_logpi, but keeps the xoh/xoh2 split as in the original code.
+
+    logemit can be (K,S,A) or (T,K,S,A).
+    """
+    Ps_jax = comp_transP(jnp.array(log_Ps), jnp.array(Rs), jnp.array(xoh))
+
+    logemit = jnp.array(logemit)
+    if logemit.ndim == 3:
+        log_likes_jax = comp_ll_jax(logemit, jnp.array(xoh2), jnp.array(aoh))
+    elif logemit.ndim == 4:
+        log_likes_jax = comp_ll_jax_timevary(logemit, jnp.array(xoh2), jnp.array(aoh))
+    else:
+        raise ValueError(f"logemit must have ndim 3 or 4, got {logemit.ndim}")
+
+    alpha_jax = forward(pi0, Ps_jax, log_likes_jax)
+    beta_jax  = backward(Ps_jax, log_likes_jax)
+    gamma_jax, xi_jax = expected_states(alpha_jax, beta_jax, Ps_jax, log_likes_jax)
+    return gamma_jax, xi_jax, alpha_jax
 
 def jaxnet_e_step_batch2(pi0, log_Ps, Rs, trans_probs, xoh_list, xoh_list2, aoh_list, logemit_list):
     """
@@ -748,6 +953,258 @@ def trans_m_step_jax_optax(
 
     return new_log_Ps, new_Rs
 
+def emit_m_step_jaxnet_optax2(
+    R_state,
+    trans_probs,
+    expectations,
+    one_hot_xs,
+    one_hot_acs,
+    one_hot_hs,
+    num_iters=1000,
+    batch_size=16,
+    discount=0.95,
+    vi_threshold=50,
+    tau=1.0,
+    return_metrics=False,
+    **kwargs
+):
+    """
+    Teacher-only M-step for reward net parameters theta.
+
+    Maximizes:
+        sum_{n,t,k} gamma[n,t,k] * log pi_{theta,t,k}(a_{n,t} | x_{n,t})
+
+    where pi_{theta,t,k} is induced by SoftVI on reward R_{theta,t,k}(s,a)
+    produced from (h_t, mode k).
+
+    IMPORTANT:
+      This function must use the SAME reward->policy map as build_logemit_list,
+      i.e. SoftVI on (reward / tau), not on raw reward.
+    """
+    apply_fn = R_state.apply_fn
+    eps = 1e-20
+
+    # -----------------------
+    # Parse expectations -> gamma: (N,T,K)
+    # -----------------------
+    gamma_arr = None
+
+    # Case 1: expectations is output of batch e-step: (gamma, xi, alpha)
+    if isinstance(expectations, (tuple, list)) and len(expectations) >= 1:
+        cand0 = jnp.array(expectations[0])
+        if cand0.ndim >= 2:
+            gamma_arr = cand0
+
+    # Case 2: expectations is list of per-traj tuples [(gamma, xi), ...]
+    if gamma_arr is None and isinstance(expectations, (list, tuple)) and len(expectations) > 0:
+        if isinstance(expectations[0], (tuple, list)):
+            gamma_arr = jnp.stack([jnp.array(e[0]) for e in expectations], axis=0)
+
+    # Case 3: expectations is directly an array
+    if gamma_arr is None:
+        gamma_arr = jnp.array(expectations)
+
+    # Common squeeze: (N,T,1,K) -> (N,T,K)
+    if gamma_arr.ndim == 4:
+        gamma_arr = gamma_arr[:, :, 0, :]
+
+    if gamma_arr.ndim != 3:
+        raise ValueError(f"[emit_m_step] gamma must be (N,T,K); got {gamma_arr.shape}")
+
+    N, T, K = gamma_arr.shape
+
+    # -----------------------
+    # Squeeze one-hots to (N,T,*)
+    # -----------------------
+    xoh = jnp.array(one_hot_xs)
+    aoh = jnp.array(one_hot_acs)
+    hoh = jnp.array(one_hot_hs)
+
+    if xoh.ndim == 4:
+        xoh = xoh[:, :, 0, :]
+    if aoh.ndim == 4:
+        aoh = aoh[:, :, 0, :]
+    if hoh.ndim == 4:
+        hoh = hoh[:, :, 0, :]
+
+    if xoh.shape[:2] != (N, T):
+        raise ValueError(
+            f"[emit_m_step] xoh must have shape (N,T,S); got {xoh.shape}, "
+            f"expected first dims {(N, T)}"
+        )
+    if aoh.shape[:2] != (N, T):
+        raise ValueError(
+            f"[emit_m_step] aoh must have shape (N,T,A); got {aoh.shape}, "
+            f"expected first dims {(N, T)}"
+        )
+    if hoh.shape[:2] != (N, T):
+        raise ValueError(
+            f"[emit_m_step] hoh must have shape (N,T,H); got {hoh.shape}, "
+            f"expected first dims {(N, T)}"
+        )
+
+    # -----------------------
+    # Hyperparameters
+    # -----------------------
+    tau = float(tau)
+    lr = float(kwargs.get("lr", 3e-4))
+    wd = float(kwargs.get("weight_decay", 0.0))
+    grad_clip = float(kwargs.get("grad_clip", 1.0))
+    seed = int(kwargs.get("seed", 0))
+
+    # ---- structural identifiability penalties ----
+    # Keep h_t-dependent reward close to a stable mode-specific base reward
+    lam_base = float(kwargs.get("lam_base", 1e-3))
+
+    # Encourage adjacent timesteps to have similar reward maps
+    lam_smooth = float(kwargs.get("lam_smooth", 1e-3))
+
+    # Planning with an absorbing goal helps distinguish "reach" from "reach-and-stay".
+    absorb_goal_state = kwargs.get("absorb_goal_state", 24)
+
+    tp = make_goal_absorbing(trans_probs, goal_state=absorb_goal_state)  # (S,A,S)
+    S, A = tp.shape[0], tp.shape[1]
+    eyeS = jnp.eye(S, dtype=tp.dtype)
+
+    # ---- AIRL-style decomposition hyperparams ----
+    lam_phi = float(kwargs.get("lam_phi", 1e-4))          # mild L2 on potential
+    center_phi = bool(kwargs.get("center_phi", True))     # fix gauge: mean_s phi = 0
+
+    def per_traj_expected_loglik(params, gamma_TK, x_Ts, a_Ta, h_TH):
+        """
+        Returns:
+            sum_{t,k} gamma[t,k] * log pi_{t,k}(a_t | x_t)
+        """
+        def per_t(h_t):
+            tmp_state = R_state.replace(params=params)
+            shaped_ksa = shaped_rewards_from_h(
+                tmp_state,
+                h_t,
+                tp,
+                discount=discount,
+                center_phi=center_phi
+            )  # (K,S,A)
+
+            pi_ksa = jax.vmap(
+                lambda r_sa: soft_vi_sa(
+                    tp,
+                    r_sa / tau,
+                    discount=discount,
+                    threshold=vi_threshold
+                )
+            )(shaped_ksa)                                            # (K,S,A)
+
+            return jnp.log(pi_ksa + eps)                             # (K,S,A)
+
+        # (T,K,S,A)
+        logemit_tksa = jax.vmap(per_t)(h_TH)
+
+        # (T,K)
+        lls_tk = comp_ll_jax_timevary(logemit_tksa, x_Ts, a_Ta)
+
+        return jnp.sum(gamma_TK * lls_tk)
+
+    def per_traj_airl_penalty(params, h_TH):
+        """
+        Mild structural regularizer:
+          - penalize potential magnitude so the model cannot dump everything into phi
+          - keep base reward smoother over time (optional but useful for h_t setup)
+        """
+
+        def per_t(h_t):
+            tmp_state = R_state.replace(params=params)
+            r_ska, phi_sk = _reward_and_phi_from_h_from_tp(
+                tmp_state,
+                h_t,
+                tp,
+                center_phi=center_phi
+            )
+            return r_ska, phi_sk
+
+        r_t_ska, phi_t_sk = jax.vmap(per_t)(h_TH)   # (T,S,K,A), (T,S,K)
+
+        # phi magnitude penalty
+        phi_pen = jnp.mean(phi_t_sk ** 2)
+
+        # keep h_t-dependent reward close to a trajectory-level base reward
+        # base reward = time-average reward map over this trajectory
+        r_base_ska = jnp.mean(r_t_ska, axis=0, keepdims=True)   # (1,S,K,A)
+        base_pen = jnp.mean((r_t_ska - r_base_ska) ** 2)
+
+        # temporal smoothness on reward
+        if h_TH.shape[0] > 1:
+            dr = r_t_ska[1:] - r_t_ska[:-1]
+            smooth_pen = jnp.mean(dr ** 2)
+        else:
+            smooth_pen = 0.0
+
+        return lam_phi * phi_pen + lam_base * base_pen + lam_smooth * smooth_pen
+
+    # -----------------------
+    # Optimizer
+    # -----------------------
+    opt = optax.chain(
+        optax.clip_by_global_norm(grad_clip),
+        optax.adamw(learning_rate=lr, weight_decay=wd),
+    )
+    opt_state = opt.init(R_state.params)
+    key = jax.random.PRNGKey(seed)
+
+    def loss_on_batch(params, idx):
+        gamma_b = gamma_arr[idx]
+        xoh_b = xoh[idx]
+        aoh_b = aoh[idx]
+        hoh_b = hoh[idx]
+
+        traj_logps = jax.vmap(
+            per_traj_expected_loglik,
+            in_axes=(None, 0, 0, 0, 0)
+        )(params, gamma_b, xoh_b, aoh_b, hoh_b)
+
+        traj_pen = jax.vmap(
+            per_traj_airl_penalty,
+            in_axes=(None, 0)
+        )(params, hoh_b)
+
+        return -jnp.sum(traj_logps) + jnp.sum(traj_pen)
+
+
+    @jax.jit
+    def step(params, opt_state, key):
+        key, subk = jax.random.split(key)
+        replace = batch_size > N
+        idx = jax.random.choice(subk, N, (batch_size,), replace=replace)
+        loss, grads = jax.value_and_grad(loss_on_batch)(params, idx)
+        updates, opt_state = opt.update(grads, opt_state, params)
+        params = optax.apply_updates(params, updates)
+        return params, opt_state, key, loss
+
+    params = R_state.params
+    last_loss = None
+    for _ in range(num_iters):
+        params, opt_state, key, last_loss = step(params, opt_state, key)
+
+    new_state = R_state.replace(params=params)
+
+    if not return_metrics:
+        return new_state
+
+    metrics = {
+        "neg_expected_loglik_batch": float(last_loss) if last_loss is not None else None,
+        "N": int(N),
+        "T": int(T),
+        "K": int(K),
+        "tau": float(tau),
+        "lr": float(lr),
+        "weight_decay": float(wd),
+        "grad_clip": float(grad_clip),
+        "lam_base": float(lam_base),
+        "lam_smooth": float(lam_smooth),
+        "lam_phi": float(lam_phi),
+    }
+    return new_state, metrics
+
+
 def pi0_m_step(all_gamma, eps=1e-8):
     # Convert lists / nested structures to a JAX array
     gamma = jnp.array(all_gamma)
@@ -766,511 +1223,3 @@ def pi0_m_step(all_gamma, eps=1e-8):
     pi0 = pi0 / jnp.sum(pi0)
 
     return jnp.log(pi0)
-
-
-def make_goal_absorbing(trans_probs, goal_state=None):  # CHANGED: no hardcoded goal state in unsupervised labyrinth setting
-    """Return a copy of trans_probs with an optional absorbing goal state.
-
-    For GW5 you often used a fixed absorbing goal to sharpen reach-vs-stay.
-    For labyrinth we should *not* hardcode a goal state in the architecture,
-    because the training script / dataset should decide whether such a prior is
-    scientifically justified.
-    """
-    tp = jnp.array(trans_probs)
-    S, A, _ = tp.shape
-    if goal_state is None:
-        return tp
-    if goal_state < 0 or goal_state >= S:
-        raise ValueError(f"goal_state={goal_state} out of bounds for S={S}")
-    goal_row = jnp.zeros((A, S), dtype=tp.dtype).at[:, goal_state].set(1.0)
-    return tp.at[goal_state, :, :].set(goal_row)
-
-
-def infer_valid_mask_from_xoh(xoh, aoh=None):  # CHANGED: infer valid timesteps from one-hot rows so padded labyrinth suffixes do not contribute to EM
-    """Infer a boolean valid mask from one-hot state / action arrays.
-
-    We treat timesteps with all-zero one-hot state rows as padding.
-    Optionally also require the action row to be non-zero.
-    Works for shapes (T,S)/(T,1,S) and (T,A)/(T,1,A).
-    """
-    x = jnp.array(xoh)
-    if x.ndim == 3 and x.shape[1] == 1:
-        x = x[:, 0, :]
-    mask = jnp.sum(x, axis=-1) > 0
-
-    if aoh is not None:
-        a = jnp.array(aoh)
-        if a.ndim == 3 and a.shape[1] == 1:
-            a = a[:, 0, :]
-        mask = jnp.logical_and(mask, jnp.sum(a, axis=-1) > 0)
-    return mask
-
-
-def forward_masked(pi0, Ps, log_likes, valid_mask):  # CHANGED: force one dtype throughout
-    log_likes = jnp.asarray(log_likes)
-    dtype = log_likes.dtype
-    pi0 = jnp.asarray(pi0, dtype=dtype)
-    Ps = jnp.asarray(Ps, dtype=dtype)
-    valid_mask = valid_mask.astype(bool)
-
-    T = log_likes.shape[0]
-
-    alpha0 = jnp.log(pi0) + jnp.where(
-        valid_mask[0],
-        log_likes[0],
-        jnp.array(0.0, dtype=dtype),
-    )
-
-    def scan_body(alpha_prev, inputs):
-        Ps_t, log_like_t, valid_t = inputs
-        Ps_t = jnp.asarray(Ps_t, dtype=dtype)
-        log_like_t = jnp.asarray(log_like_t, dtype=dtype)
-        m = jnp.max(alpha_prev)
-        alpha_prop = jnp.log(jnp.dot(jnp.exp(alpha_prev - m), Ps_t)) + m + log_like_t
-        alpha_prop = jnp.asarray(alpha_prop, dtype=dtype)
-        alpha_t = jnp.where(valid_t, alpha_prop, alpha_prev)
-        alpha_t = jnp.asarray(alpha_t, dtype=dtype)
-        return alpha_t, alpha_t
-
-    if T <= 1:
-        return alpha0[None, :]
-
-    _, alphas = lax.scan(scan_body, alpha0, (Ps, log_likes[1:], valid_mask[1:]))
-    return jnp.concatenate([alpha0[None, :], alphas], axis=0)
-
-def backward_masked(Ps, log_likes, valid_mask):  # CHANGED: force one dtype throughout
-    log_likes = jnp.asarray(log_likes)
-    dtype = log_likes.dtype
-    Ps = jnp.asarray(Ps, dtype=dtype)
-    valid_mask = valid_mask.astype(bool)
-
-    T = log_likes.shape[0]
-    K = log_likes.shape[1]
-    betaT = jnp.zeros((K,), dtype=dtype)
-
-    def scan_body(beta_next, inputs):
-        Ps_t, log_like_next, valid_next = inputs
-        Ps_t = jnp.asarray(Ps_t, dtype=dtype)
-        log_like_next = jnp.asarray(log_like_next, dtype=dtype)
-        tmp = log_like_next + beta_next
-        m = jnp.max(tmp)
-        beta_prop = jnp.log(jnp.dot(Ps_t, jnp.exp(tmp - m))) + m
-        beta_prop = jnp.asarray(beta_prop, dtype=dtype)
-        beta_t = jnp.where(valid_next, beta_prop, beta_next)
-        beta_t = jnp.asarray(beta_t, dtype=dtype)
-        return beta_t, beta_t
-
-    if T <= 1:
-        return betaT[None, :]
-
-    _, betas = lax.scan(
-        scan_body,
-        betaT,
-        (Ps[::-1], log_likes[1:][::-1], valid_mask[1:][::-1]),
-    )
-    return jnp.concatenate([betas[::-1], betaT[None, :]], axis=0)
-
-def expected_states_masked(alphas, betas, Ps, ll, valid_mask):  # CHANGED: force one dtype throughout
-    ll = jnp.asarray(ll)
-    dtype = ll.dtype
-    alphas = jnp.asarray(alphas, dtype=dtype)
-    betas = jnp.asarray(betas, dtype=dtype)
-    Ps = jnp.asarray(Ps, dtype=dtype)
-    valid_mask = valid_mask.astype(dtype)
-
-    log_gamma = alphas + betas
-    log_gamma -= jax_logsumexp(log_gamma, axis=1, keepdims=True)
-    gamma = jnp.exp(log_gamma) * valid_mask[:, None]
-
-    log_Ps = jnp.log(Ps + jnp.array(1e-20, dtype=dtype))
-    log_xi = alphas[:-1, :, None] + betas[1:, None, :] + ll[1:, None, :] + log_Ps
-    log_xi -= jax_logsumexp(log_xi.reshape(log_xi.shape[0], -1), axis=1)[:, None, None]
-    xi = jnp.exp(log_xi)
-
-    trans_mask = (valid_mask[:-1] * valid_mask[1:])[:, None, None]
-    xi = xi * trans_mask
-    return gamma, xi
-
-
-def comp_ll_jax_timevary_masked(logits_tksa, one_hot_x, one_hot_a, valid_mask=None):  # CHANGED: padded rows contribute zero ll
-    lls_tk = comp_ll_jax_timevary(logits_tksa, one_hot_x, one_hot_a)
-    if valid_mask is None:
-        return lls_tk
-    return lls_tk * valid_mask[:, None]
-
-
-def jaxnet_e_step_logpi2(pi0, log_Ps, Rs, logemit, trans_probs, xoh, xoh2, aoh):  # CHANGED: padding-aware E-step for labyrinth
-    Ps_jax = comp_transP(jnp.array(log_Ps), jnp.array(Rs), jnp.array(xoh))
-
-    logemit = jnp.array(logemit)
-    if logemit.ndim == 3:
-        log_likes_jax = comp_ll_jax(logemit, jnp.array(xoh2), jnp.array(aoh))
-    elif logemit.ndim == 4:
-        valid_mask = infer_valid_mask_from_xoh(xoh2, aoh)
-        log_likes_jax = comp_ll_jax_timevary_masked(logemit, jnp.array(xoh2), jnp.array(aoh), valid_mask)
-    else:
-        raise ValueError(f"logemit must have ndim 3 or 4, got {logemit.ndim}")
-
-    valid_mask = infer_valid_mask_from_xoh(xoh2, aoh)
-    alpha_jax = forward_masked(pi0, Ps_jax, log_likes_jax, valid_mask)
-    beta_jax  = backward_masked(Ps_jax, log_likes_jax, valid_mask)
-    gamma_jax, xi_jax = expected_states_masked(alpha_jax, beta_jax, Ps_jax, log_likes_jax, valid_mask)
-    return gamma_jax, xi_jax, alpha_jax
-
-
-def amortized_e_step_batch(inf_state, hoh_batch, xoh_batch, aoh_batch):  # CHANGED: padding-aware student marginals
-    hoh = jnp.array(hoh_batch)
-    if hoh.ndim == 4 and hoh.shape[2] == 1:
-        hoh = hoh[:, :, 0, :]
-
-    xoh = jnp.array(xoh_batch)
-    if xoh.ndim == 4 and xoh.shape[2] == 1:
-        xoh = xoh[:, :, 0, :]
-
-    aoh = jnp.array(aoh_batch)
-    if aoh.ndim == 4 and aoh.shape[2] == 1:
-        aoh = aoh[:, :, 0, :]
-
-    def per_traj(h_TH, x_TS, a_TA):
-        node_logits_tk, edge_logits_tkk = inf_state.apply_fn(
-            {'params': inf_state.params}, h_TH, x_TS, a_TA, train=False
-        )
-        gamma, xi, alpha = structured_q_marginals(node_logits_tk, edge_logits_tkk)
-        valid_mask = infer_valid_mask_from_xoh(x_TS, a_TA).astype(gamma.dtype)
-        gamma = gamma * valid_mask[:, None]                      # CHANGED: zero padded suffix
-        xi = xi * (valid_mask[:-1] * valid_mask[1:])[:, None, None]  # CHANGED
-        return gamma, xi, alpha
-
-    return jax.vmap(per_traj)(hoh, xoh, aoh)
-
-
-def semi_amortized_e_step_batch(
-    inf_state,
-    hoh_batch, xoh_batch, aoh_batch,
-    logemit_batch,
-    pi0, log_Ps, Rs, trans_probs_j,
-    lam_edge=0.5,
-    lam_node=0.0,
-    lam_prior=0.0,
-    mode_prior=None,
-    trust_gate=True,
-    trust_temp=1.0,
-    trust_floor=0.0,
-    trust_cap=1.0,
-    eta_post=0.0,
-    eps=1e-8
-):
-    """Same semi-amortized E-step as GW5, but now padding-aware for labyrinth."""
-    logemit = jnp.asarray(logemit_batch, dtype=jnp.float32)   # CHANGED
-    work_dtype = logemit.dtype                                # CHANGED
-
-    hoh = jnp.asarray(hoh_batch, dtype=work_dtype)            # CHANGED
-    if hoh.ndim == 4 and hoh.shape[2] == 1:
-        hoh = hoh[:, :, 0, :]
-
-    xoh = jnp.asarray(xoh_batch, dtype=work_dtype)            # CHANGED
-    aoh = jnp.asarray(aoh_batch, dtype=work_dtype)            # CHANGED
-
-    aoh_ll = aoh
-    if aoh_ll.ndim == 4 and aoh_ll.shape[2] == 1:
-        aoh_ll = aoh_ll[:, :, 0, :]
-
-    pi0 = jnp.asarray(pi0, dtype=work_dtype)                  # CHANGED
-    log_Ps = jnp.asarray(log_Ps, dtype=work_dtype)            # CHANGED
-    Rs = jnp.asarray(Rs, dtype=work_dtype)                    # CHANGED
-
-    K = logemit.shape[2]
-    if mode_prior is None:
-        mode_prior = jnp.ones((K,), dtype=logemit.dtype) / K
-    mode_prior = jnp.array(mode_prior, dtype=logemit.dtype)
-    mode_prior = mode_prior / (jnp.sum(mode_prior) + eps)
-    log_mode_prior = jnp.log(mode_prior + eps)
-    logK = jnp.log(jnp.array(K, dtype=logemit.dtype) + eps)
-
-    lam_edge_j = jnp.array(lam_edge, dtype=logemit.dtype)
-    lam_node_j = jnp.array(lam_node, dtype=logemit.dtype)
-    lam_prior_j = jnp.array(lam_prior, dtype=logemit.dtype)
-    eta_post_j = jnp.array(eta_post, dtype=logemit.dtype)
-    trust_temp_j = jnp.array(trust_temp, dtype=logemit.dtype)
-    trust_floor_j = jnp.array(trust_floor, dtype=logemit.dtype)
-    trust_cap_j = jnp.array(trust_cap, dtype=logemit.dtype)
-
-    def _entropy_from_logp(logp, axis=-1):
-        p = jnp.exp(logp)
-        return -jnp.sum(p * logp, axis=axis)
-
-    def _trust_from_ent(ent):
-        conf = 1.0 - ent / (logK + eps)
-        conf = jnp.clip(conf, 0.0, 1.0)
-        conf = conf ** (1.0 / (trust_temp_j + eps))
-        return jnp.clip(conf, trust_floor_j, trust_cap_j)
-
-    def per_traj(h_TH, x_T1S, a_TA, logemit_TKSA):
-        Ps = comp_transP(log_Ps, Rs, x_T1S)
-        valid_mask = infer_valid_mask_from_xoh(x_T1S, a_TA)
-        log_likes = comp_ll_jax_timevary_masked(logemit_TKSA, x_T1S, a_TA, valid_mask)
-
-        x_TS = x_T1S[:, 0, :] if x_T1S.ndim == 3 else x_T1S
-        node_logits_tk, edge_logits_tkk = inf_state.apply_fn(
-            {'params': inf_state.params}, h_TH, x_TS, a_TA, train=False
-        )
-
-        log_qnode = jax.nn.log_softmax(node_logits_tk, axis=-1)
-        log_qtrans = jax.nn.log_softmax(edge_logits_tkk, axis=-1)
-
-        if trust_gate:
-            ent_node = _entropy_from_logp(log_qnode, axis=-1)
-            trust_node = _trust_from_ent(ent_node)
-            ent_edge = _entropy_from_logp(log_qtrans, axis=-1)
-            trust_edge = _trust_from_ent(jnp.mean(ent_edge, axis=-1))
-        else:
-            trust_node = jnp.ones((log_qnode.shape[0],), dtype=logemit.dtype)
-            trust_edge = jnp.ones((log_qtrans.shape[0],), dtype=logemit.dtype)
-
-        if lam_edge != 0.0:
-            logPs_tilde = jnp.log(Ps + eps) + (lam_edge_j * trust_edge)[:, None, None] * log_qtrans
-            Ps = jax.nn.softmax(logPs_tilde, axis=-1)
-
-        if lam_node != 0.0:
-            log_likes = log_likes + (lam_node_j * trust_node)[:, None] * log_qnode
-
-        if lam_prior != 0.0:
-            log_likes = log_likes + lam_prior_j * log_mode_prior[None, :]
-
-        alpha = forward_masked(pi0, Ps, log_likes, valid_mask)      # CHANGED: mask-aware forward-backward
-        beta = backward_masked(Ps, log_likes, valid_mask)            # CHANGED
-        gamma, xi = expected_states_masked(alpha, beta, Ps, log_likes, valid_mask)  # CHANGED
-
-        if eta_post != 0.0:
-            q_student, _, _ = structured_q_marginals(node_logits_tk, edge_logits_tkk)
-            gamma = (1.0 - eta_post_j) * gamma + eta_post_j * q_student
-            gamma = gamma / jnp.clip(jnp.sum(gamma, axis=-1, keepdims=True), a_min=eps)
-            gamma = gamma * valid_mask[:, None]                      # CHANGED: keep padded rows at zero after blending
-
-        return gamma, xi, alpha
-
-    return jax.vmap(per_traj)(hoh, xoh, aoh_ll, logemit)
-
-
-def emit_m_step_jaxnet_optax2(
-    R_state,
-    trans_probs,
-    expectations,
-    one_hot_xs,
-    one_hot_acs,
-    one_hot_hs,
-    num_iters=1000,
-    batch_size=1,   # CHANGED: safest default for labyrinth memory
-    discount=0.95,
-    vi_threshold=50,
-    tau=1.0,
-    return_metrics=False,
-    **kwargs
-):
-    """Teacher-only M-step for the reward net, padding-aware and memory-aware for labyrinth.
-
-    Main memory optimization:
-    - process outer trajectory batches sequentially
-    - process time within each trajectory in small chunks
-    - avoid materializing (T,K,S,A) for the full trajectory inside the gradient step
-    """
-    eps = 1e-20
-
-    gamma_arr = None
-    if isinstance(expectations, (tuple, list)) and len(expectations) >= 1:
-        cand0 = jnp.array(expectations[0])
-        if cand0.ndim >= 2:
-            gamma_arr = cand0
-    if gamma_arr is None and isinstance(expectations, (list, tuple)) and len(expectations) > 0:
-        if isinstance(expectations[0], (tuple, list)):
-            gamma_arr = jnp.stack([jnp.array(e[0]) for e in expectations], axis=0)
-    if gamma_arr is None:
-        gamma_arr = jnp.array(expectations)
-    if gamma_arr.ndim == 4:
-        gamma_arr = gamma_arr[:, :, 0, :]
-    if gamma_arr.ndim != 3:
-        raise ValueError(f"[emit_m_step] gamma must be (N,T,K); got {gamma_arr.shape}")
-
-    xoh = jnp.array(one_hot_xs, dtype=jnp.float32)
-    aoh = jnp.array(one_hot_acs, dtype=jnp.float32)
-    hoh = jnp.array(one_hot_hs, dtype=jnp.float32)
-    gamma_arr = jnp.array(gamma_arr, dtype=jnp.float32)
-
-    if xoh.ndim == 4:
-        xoh = xoh[:, :, 0, :]
-    if aoh.ndim == 4:
-        aoh = aoh[:, :, 0, :]
-    if hoh.ndim == 4:
-        hoh = hoh[:, :, 0, :]
-
-    N, T, K = gamma_arr.shape
-
-    tau = float(tau)
-    lr = float(kwargs.get("lr", 3e-4))
-    wd = float(kwargs.get("weight_decay", 0.0))
-    grad_clip = float(kwargs.get("grad_clip", 1.0))
-    seed = int(kwargs.get("seed", 0))
-    lam_base = float(kwargs.get("lam_base", 1e-3))
-    lam_smooth = float(kwargs.get("lam_smooth", 1e-3))
-    lam_phi = float(kwargs.get("lam_phi", 1e-4))
-    center_phi = bool(kwargs.get("center_phi", True))
-    absorb_goal_state = kwargs.get("absorb_goal_state", None)
-    tp = make_goal_absorbing(trans_probs, goal_state=absorb_goal_state)
-    time_chunk_size = int(kwargs.get("time_chunk_size", 32))  # CHANGED
-
-    dtype = xoh.dtype
-
-    def _reward_logpi_chunk(params, h_chunk):
-        tmp_state = R_state.replace(params=params)
-
-        def per_t(h_t):
-            shaped_ksa = shaped_rewards_from_h(
-                tmp_state, h_t, tp, discount=discount, center_phi=center_phi
-            )  # (K,S,A)
-            pi_ksa = jax.vmap(
-                lambda r_sa: soft_vi_sa(
-                    tp, r_sa / tau, discount=discount, threshold=vi_threshold
-                )
-            )(shaped_ksa)
-            return jnp.log(pi_ksa + eps)
-
-        return jax.vmap(per_t)(h_chunk)  # (C,K,S,A)
-
-    def per_traj_expected_loglik(params, gamma_TK, x_Ts, a_Ta, h_TH):
-        valid_mask = infer_valid_mask_from_xoh(x_Ts, a_Ta).astype(dtype)
-        total = jnp.array(0.0, dtype=dtype)
-
-        for t0 in range(0, T, time_chunk_size):  # CHANGED: time-chunked reward/policy build
-            t1 = min(t0 + time_chunk_size, T)
-            h_chunk = h_TH[t0:t1]
-            x_chunk = x_Ts[t0:t1]
-            a_chunk = a_Ta[t0:t1]
-            g_chunk = gamma_TK[t0:t1]
-            vm_chunk = valid_mask[t0:t1]
-
-            logemit_chunk = _reward_logpi_chunk(params, h_chunk)
-            ll_chunk = comp_ll_jax_timevary_masked(logemit_chunk, x_chunk, a_chunk, vm_chunk)
-            total = total + jnp.sum((g_chunk * vm_chunk[:, None]) * ll_chunk)
-
-        return total
-
-    def per_traj_airl_penalty(params, h_TH, valid_mask):
-        valid_mask = valid_mask.astype(dtype)
-
-        phi_sq_sum = jnp.array(0.0, dtype=dtype)
-        phi_count = jnp.array(0.0, dtype=dtype)
-
-        r_sum = None
-        r_sq_sum = None
-        r_count = jnp.array(0.0, dtype=dtype)
-
-        smooth_sum = jnp.array(0.0, dtype=dtype)
-        smooth_count = jnp.array(0.0, dtype=dtype)
-
-        prev_r = None
-        prev_valid = jnp.array(0.0, dtype=dtype)
-
-        tmp_state = R_state.replace(params=params)
-
-        def per_t(h_t):
-            return _reward_and_phi_from_h_from_tp(tmp_state, h_t, tp, center_phi=center_phi)
-
-        for t0 in range(0, T, time_chunk_size):  # CHANGED: time-chunked penalty build
-            t1 = min(t0 + time_chunk_size, T)
-            h_chunk = h_TH[t0:t1]
-            vm_chunk = valid_mask[t0:t1]
-
-            r_chunk_ska, phi_chunk_sk = jax.vmap(per_t)(h_chunk)  # (C,S,K,A), (C,S,K)
-
-            vm_r = vm_chunk[:, None, None, None]
-            vm_phi = vm_chunk[:, None, None]
-
-            phi_sq_sum = phi_sq_sum + jnp.sum((phi_chunk_sk ** 2) * vm_phi)
-            phi_count = phi_count + jnp.sum(vm_phi)
-
-            if r_sum is None:
-                r_sum = jnp.sum(r_chunk_ska * vm_r, axis=0)
-                r_sq_sum = jnp.sum((r_chunk_ska ** 2) * vm_r, axis=0)
-            else:
-                r_sum = r_sum + jnp.sum(r_chunk_ska * vm_r, axis=0)
-                r_sq_sum = r_sq_sum + jnp.sum((r_chunk_ska ** 2) * vm_r, axis=0)
-            r_count = r_count + jnp.sum(vm_chunk)
-
-            if r_chunk_ska.shape[0] > 1:
-                pair_mask = (vm_chunk[1:] * vm_chunk[:-1])[:, None, None, None]
-                dr = r_chunk_ska[1:] - r_chunk_ska[:-1]
-                smooth_sum = smooth_sum + jnp.sum((dr ** 2) * pair_mask)
-                smooth_count = smooth_count + jnp.sum(pair_mask)
-
-            first_valid = vm_chunk[0]
-            if prev_r is not None:
-                boundary_mask = (prev_valid * first_valid)[:, None, None] if prev_valid.ndim > 0 else (prev_valid * first_valid)
-                dr0 = r_chunk_ska[0] - prev_r
-                smooth_sum = smooth_sum + jnp.sum((dr0 ** 2) * (prev_valid * first_valid))
-                smooth_count = smooth_count + (prev_valid * first_valid)
-
-            prev_r = r_chunk_ska[-1]
-            prev_valid = vm_chunk[-1]
-
-        phi_count = jnp.clip(phi_count, a_min=1.0)
-        r_count = jnp.clip(r_count, a_min=1.0)
-        smooth_count = jnp.clip(smooth_count, a_min=1.0)
-
-        phi_pen = phi_sq_sum / phi_count
-        r_mean = r_sum / r_count
-        base_pen = jnp.sum(r_sq_sum / r_count - r_mean ** 2)
-        smooth_pen = smooth_sum / smooth_count
-
-        return lam_phi * phi_pen + lam_base * base_pen + lam_smooth * smooth_pen
-
-    def loss_fn(params, batch_idx):
-        b_gamma = gamma_arr[batch_idx]
-        b_x = xoh[batch_idx]
-        b_a = aoh[batch_idx]
-        b_h = hoh[batch_idx]
-
-        ll_sum = jnp.array(0.0, dtype=dtype)
-        pen_sum = jnp.array(0.0, dtype=dtype)
-        B = b_gamma.shape[0]
-
-        for i in range(B):  # CHANGED: sequential outer batch to minimize peak memory
-            g_i = b_gamma[i]
-            x_i = b_x[i]
-            a_i = b_a[i]
-            h_i = b_h[i]
-            valid_i = infer_valid_mask_from_xoh(x_i, a_i)
-
-            ll_sum = ll_sum + per_traj_expected_loglik(params, g_i, x_i, a_i, h_i)
-            pen_sum = pen_sum + per_traj_airl_penalty(params, h_i, valid_i)
-
-        return -((ll_sum / B) - (pen_sum / B))
-
-    if grad_clip > 0:
-        tx = optax.chain(optax.clip_by_global_norm(grad_clip), optax.adamw(lr, weight_decay=wd))
-    else:
-        tx = optax.adamw(lr, weight_decay=wd)
-
-    opt_state = tx.init(R_state.params)
-    params = R_state.params
-    rng = npr.RandomState(seed)
-    n_batches = max(1, int(np.ceil(N / batch_size)))
-    losses = []
-
-    def step(params, opt_state, batch_idx):
-        loss, grads = jax.value_and_grad(loss_fn)(params, batch_idx)
-        updates, opt_state = tx.update(grads, opt_state, params)
-        params = optax.apply_updates(params, updates)
-        return params, opt_state, loss
-
-    for _ in range(num_iters):
-        perm = rng.permutation(N)
-        for bi in range(n_batches):
-            idx = perm[bi * batch_size : (bi + 1) * batch_size]
-            idx = jnp.array(idx)
-            params, opt_state, loss = step(params, opt_state, idx)
-            losses.append(loss)
-
-    new_state = R_state.replace(params=params)
-    if return_metrics:
-        return new_state, {"losses": jnp.array(losses)}
-    return new_state
